@@ -1,0 +1,271 @@
+'use strict';
+// Built-in app templates. Each becomes a compose stack under DATA_DIR/stacks/<id>.
+// icon is a local /icons/apps/<id>.svg filename stem (no remote loading).
+
+module.exports = [
+  {
+    id: 'jellyfin', name: 'Jellyfin', category: 'Media', featured: true,
+    blurb: 'Free software media system for movies, TV and music.',
+    icon: 'jellyfin', color: '#aa5cc3',
+    image: 'jellyfin/jellyfin:latest',
+    ports: [{ key: 'web', label: 'Web UI', default: 8096, container: 8096 }],
+    volumes: [
+      { key: 'config', label: 'Config', default: './config', container: '/config' },
+      { key: 'media', label: 'Media library', default: './media', container: '/media' },
+    ],
+    env: [],
+    open: (c) => `http://localhost:${c.ports.web}`,
+  },
+  {
+    id: 'plex', name: 'Plex', category: 'Media', featured: true,
+    blurb: 'Stream movies and TV with Plex Media Server.',
+    icon: 'plex', color: '#e5a00d',
+    image: 'plexinc/pms-docker:latest',
+    ports: [{ key: 'web', label: 'Web UI', default: 32400, container: 32400 }],
+    volumes: [
+      { key: 'config', label: 'Config', default: './config', container: '/config' },
+      { key: 'media', label: 'Media', default: './media', container: '/data' },
+      { key: 'transcode', label: 'Transcode', default: './transcode', container: '/transcode' },
+    ],
+    env: [
+      { key: 'TZ', label: 'Timezone', default: 'UTC' },
+      { key: 'PLEX_CLAIM', label: 'Claim token (optional)', default: '' },
+    ],
+    open: (c) => `http://localhost:${c.ports.web}/web`,
+  },
+  {
+    id: 'navidrome', name: 'Navidrome', category: 'Media',
+    blurb: 'Lightweight personal music streaming server (Subsonic-compatible).',
+    icon: 'navidrome', color: '#ed7d31',
+    image: 'deluan/navidrome:latest',
+    ports: [{ key: 'web', label: 'Web UI', default: 4533, container: 4533 }],
+    volumes: [
+      { key: 'data', label: 'Data', default: './data', container: '/data' },
+      { key: 'music', label: 'Music library', default: './music', container: '/music' },
+    ],
+    env: [{ key: 'ND_SCANSCHEDULE', label: 'Scan schedule', default: '1h' }],
+    open: (c) => `http://localhost:${c.ports.web}`,
+  },
+  {
+    id: 'immich', name: 'Immich', category: 'Media', featured: true,
+    blurb: 'Self-hosted photo and video backup (like Google Photos). Bundles server + Postgres + Redis.',
+    icon: 'immich', color: '#ed4d77',
+    image: 'ghcr.io/immich-app/immich-server:release',
+    ports: [{ key: 'web', label: 'Web UI', default: 2283, container: 2283 }],
+    volumes: [
+      { key: 'upload', label: 'Upload / library', default: './library', container: '/usr/src/app/upload' },
+      { key: 'db', label: 'Postgres data', default: './postgres', container: '/var/lib/postgresql/data' },
+    ],
+    env: [
+      { key: 'DB_PASSWORD', label: 'Database password', default: 'immich', secret: true },
+    ],
+    open: (c) => `http://localhost:${c.ports.web}`,
+    compose: (c) => ({
+      services: {
+        immich_server: {
+          image: 'ghcr.io/immich-app/immich-server:release',
+          container_name: (c.name || 'immich') + '_server',
+          restart: 'unless-stopped',
+          ports: [`${c.ports.web}:2283`],
+          volumes: [`${c.volumes.upload}:/usr/src/app/upload`],
+          environment: {
+            DB_HOSTNAME: 'immich_postgres', DB_USERNAME: 'postgres', DB_PASSWORD: c.env.DB_PASSWORD || 'immich', DB_DATABASE_NAME: 'immich',
+            REDIS_HOSTNAME: 'immich_redis',
+          },
+          depends_on: ['immich_postgres', 'immich_redis'],
+        },
+        immich_postgres: {
+          image: 'tensorchord/pgvecto-rs:pg14-v0.2.0',
+          container_name: (c.name || 'immich') + '_postgres',
+          restart: 'unless-stopped',
+          environment: { POSTGRES_PASSWORD: c.env.DB_PASSWORD || 'immich', POSTGRES_USER: 'postgres', POSTGRES_DB: 'immich' },
+          volumes: [`${c.volumes.db}:/var/lib/postgresql/data`],
+        },
+        immich_redis: {
+          image: 'redis:6.2-alpine',
+          container_name: (c.name || 'immich') + '_redis',
+          restart: 'unless-stopped',
+        },
+      },
+    }),
+  },
+  {
+    id: 'homeassistant', name: 'Home Assistant', category: 'Home', featured: true,
+    blurb: 'Open-source home automation that puts local control first.',
+    icon: 'homeassistant', color: '#18bcf2',
+    image: 'ghcr.io/home-assistant/home-assistant:stable',
+    ports: [{ key: 'web', label: 'Web UI', default: 8123, container: 8123 }],
+    volumes: [
+      { key: 'config', label: 'Config', default: './config', container: '/config' },
+    ],
+    env: [{ key: 'TZ', label: 'Timezone', default: 'UTC' }],
+    open: (c) => `http://localhost:${c.ports.web}`,
+    extra: () => ({ privileged: true }),
+  },
+  {
+    id: 'pihole', name: 'Pi-hole', category: 'Network',
+    blurb: 'Network-wide ad blocker. Default UI port avoids Umbrel’s port 80.',
+    icon: 'pihole', color: '#96060c',
+    image: 'pihole/pihole:latest',
+    ports: [
+      { key: 'dns', label: 'DNS (UDP/TCP)', default: 53, container: 53, protocol: 'tcp' },
+      { key: 'web', label: 'Web UI (HTTP)', default: 8081, container: 80, warnConflict: 80 },
+    ],
+    volumes: [
+      { key: 'etc', label: 'Pi-hole config', default: './etc-pihole', container: '/etc/pihole' },
+      { key: 'dnsmasq', label: 'dnsmasq config', default: './etc-dnsmasq.d', container: '/etc/dnsmasq.d' },
+    ],
+    env: [
+      { key: 'TZ', label: 'Timezone', default: 'UTC' },
+      { key: 'WEBPASSWORD', label: 'Admin password', default: '', secret: true },
+    ],
+    open: (c) => `http://localhost:${c.ports.web}/admin`,
+    extra: (c) => ({ cap_add: ['NET_ADMIN'], dns: ['127.0.0.1', '1.1.1.1'] }),
+  },
+  {
+    id: 'adguard', name: 'AdGuard Home', category: 'Network', featured: true,
+    blurb: 'Network-wide ads & trackers blocking DNS server.',
+    icon: 'adguard', color: '#68b984',
+    image: 'adguard/adguardhome:latest',
+    ports: [
+      { key: 'web', label: 'Web UI', default: 3000, container: 3000 },
+      { key: 'dns', label: 'DNS', default: 53, container: 53 },
+    ],
+    volumes: [
+      { key: 'work', label: 'Work', default: './work', container: '/opt/adguardhome/work' },
+      { key: 'conf', label: 'Config', default: './conf', container: '/opt/adguardhome/conf' },
+    ],
+    env: [],
+    open: (c) => `http://localhost:${c.ports.web}`,
+  },
+  {
+    id: 'wireguard', name: 'WireGuard Easy', category: 'Network',
+    blurb: 'Simple WireGuard VPN with a web UI for client configs.',
+    icon: 'wireguard', color: '#88171a',
+    image: 'ghcr.io/wg-easy/wg-easy:latest',
+    ports: [
+      { key: 'web', label: 'Web UI', default: 51821, container: 51821 },
+      { key: 'vpn', label: 'WireGuard UDP', default: 51820, container: 51820, protocol: 'udp' },
+    ],
+    volumes: [{ key: 'data', label: 'Data', default: './data', container: '/etc/wireguard' }],
+    env: [
+      { key: 'WG_HOST', label: 'Public hostname / IP', default: '' },
+      { key: 'PASSWORD_HASH', label: 'UI password hash (optional)', default: '' },
+    ],
+    open: (c) => `http://localhost:${c.ports.web}`,
+    extra: () => ({ cap_add: ['NET_ADMIN', 'SYS_MODULE'], sysctls: { 'net.ipv4.conf.all.src_valid_mark': '1', 'net.ipv4.ip_forward': '1' } }),
+  },
+  {
+    id: 'qbittorrent', name: 'qBittorrent', category: 'Network',
+    blurb: 'BitTorrent client with a polished web UI.',
+    icon: 'qbittorrent', color: '#2f67cd',
+    image: 'lscr.io/linuxserver/qbittorrent:latest',
+    ports: [
+      { key: 'web', label: 'Web UI', default: 8085, container: 8080 },
+      { key: 'bt', label: 'BitTorrent', default: 6881, container: 6881 },
+    ],
+    volumes: [
+      { key: 'config', label: 'Config', default: './config', container: '/config' },
+      { key: 'downloads', label: 'Downloads', default: './downloads', container: '/downloads' },
+    ],
+    env: [
+      { key: 'PUID', label: 'PUID', default: '1000' },
+      { key: 'PGID', label: 'PGID', default: '1000' },
+      { key: 'TZ', label: 'Timezone', default: 'UTC' },
+    ],
+    open: (c) => `http://localhost:${c.ports.web}`,
+  },
+  {
+    id: 'vaultwarden', name: 'Vaultwarden', category: 'Security', featured: true,
+    blurb: 'Lightweight Bitwarden-compatible password manager server.',
+    icon: 'vaultwarden', color: '#175ddc',
+    image: 'vaultwarden/server:latest',
+    ports: [{ key: 'web', label: 'Web UI', default: 8083, container: 80 }],
+    volumes: [{ key: 'data', label: 'Data', default: './data', container: '/data' }],
+    env: [{ key: 'SIGNUPS_ALLOWED', label: 'Allow signups', default: 'true' }],
+    open: (c) => `http://localhost:${c.ports.web}`,
+  },
+  {
+    id: 'gitea', name: 'Gitea', category: 'Dev',
+    blurb: 'Lightweight self-hosted Git service.',
+    icon: 'gitea', color: '#609926',
+    image: 'gitea/gitea:latest',
+    ports: [
+      { key: 'web', label: 'Web UI', default: 3002, container: 3000 },
+      { key: 'ssh', label: 'SSH', default: 2222, container: 22 },
+    ],
+    volumes: [
+      { key: 'data', label: 'Data', default: './data', container: '/data' },
+    ],
+    env: [
+      { key: 'USER_UID', label: 'UID', default: '1000' },
+      { key: 'USER_GID', label: 'GID', default: '1000' },
+    ],
+    open: (c) => `http://localhost:${c.ports.web}`,
+  },
+  {
+    id: 'portainer', name: 'Portainer', category: 'Dev',
+    blurb: 'Docker management UI. Mounts the host Docker socket.',
+    icon: 'portainer', color: '#13bef9',
+    image: 'portainer/portainer-ce:latest',
+    ports: [{ key: 'web', label: 'Web UI', default: 9000, container: 9000 }],
+    volumes: [
+      { key: 'data', label: 'Data', default: './data', container: '/data' },
+      { key: 'sock', label: 'Docker socket', default: '/var/run/docker.sock', container: '/var/run/docker.sock', host: true },
+    ],
+    env: [],
+    open: (c) => `http://localhost:${c.ports.web}`,
+  },
+  {
+    id: 'nextcloud', name: 'Nextcloud', category: 'Tools',
+    blurb: 'Self-hosted file sync, calendar, contacts and more.',
+    icon: 'nextcloud', color: '#0082c9',
+    image: 'nextcloud:latest',
+    ports: [{ key: 'web', label: 'Web UI', default: 8082, container: 80 }],
+    volumes: [
+      { key: 'html', label: 'App data', default: './html', container: '/var/www/html' },
+    ],
+    env: [{ key: 'NEXTCLOUD_TRUSTED_DOMAINS', label: 'Trusted domains', default: 'localhost' }],
+    open: (c) => `http://localhost:${c.ports.web}`,
+  },
+  {
+    id: 'filebrowser', name: 'File Browser', category: 'Tools',
+    blurb: 'Web file manager with sharing and a simple editor.',
+    icon: 'filebrowser', color: '#3b82f6',
+    image: 'filebrowser/filebrowser:latest',
+    ports: [{ key: 'web', label: 'Web UI', default: 8084, container: 80 }],
+    volumes: [
+      { key: 'srv', label: 'Served folder', default: './srv', container: '/srv' },
+      { key: 'db', label: 'Database file', default: './filebrowser.db', container: '/database.db' },
+    ],
+    env: [],
+    open: (c) => `http://localhost:${c.ports.web}`,
+  },
+  {
+    id: 'uptime-kuma', name: 'Uptime Kuma', category: 'Tools',
+    blurb: 'Self-hosted uptime monitoring with a clean status page.',
+    icon: 'uptime-kuma', color: '#67c23a',
+    image: 'louislam/uptime-kuma:1',
+    ports: [{ key: 'web', label: 'Web UI', default: 3001, container: 3001 }],
+    volumes: [{ key: 'data', label: 'Data', default: './data', container: '/app/data' }],
+    env: [],
+    open: (c) => `http://localhost:${c.ports.web}`,
+  },
+  {
+    id: 'syncthing', name: 'Syncthing', category: 'Tools',
+    blurb: 'Continuous file synchronisation between your devices.',
+    icon: 'syncthing', color: '#00a5d8',
+    image: 'syncthing/syncthing:latest',
+    ports: [
+      { key: 'web', label: 'Web UI', default: 8384, container: 8384 },
+      { key: 'sync', label: 'Sync protocol', default: 22000, container: 22000 },
+      { key: 'discovery', label: 'Local discovery (UDP)', default: 21027, container: 21027, protocol: 'udp' },
+    ],
+    volumes: [
+      { key: 'config', label: 'Config', default: './config', container: '/var/syncthing/config' },
+      { key: 'data', label: 'Synced folder', default: './data', container: '/var/syncthing' },
+    ],
+    env: [],
+    open: (c) => `http://localhost:${c.ports.web}`,
+  },
+];

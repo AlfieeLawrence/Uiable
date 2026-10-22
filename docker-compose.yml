@@ -1,0 +1,43 @@
+# Uiable - run with:  docker compose up -d --build
+# Then from your PC:  ssh -L 8080:localhost:8080 user@your-server  and open http://localhost:8080
+#
+# Change the port / bind address in a .env file next to this file (see .env.example):
+#   UIABLE_PORT=8080
+#   UIABLE_BIND=127.0.0.1   # keep this unless you know what you're doing (see README "Security")
+services:
+  uiable:
+    build: .                # always built from this folder's source
+    image: uiable:local     # local tag only, never pulled from a registry
+    pull_policy: build
+    container_name: uiable
+    restart: unless-stopped
+    # Uiable manages the host, so it needs the host's PID namespace + privileges
+    # (nsenter into PID 1) and the host network (stats, Wi-Fi, binding to host 127.0.0.1).
+    privileged: true
+    pid: host
+    network_mode: host
+    uts: host                 # live host hostname straight from /proc (no process spawn)
+    # Lightweight by design: hard caps so it can never hog the server.
+    mem_limit: 256m
+    memswap_limit: 256m
+    cpus: 1.0
+    environment:
+      UIABLE_BIND: ${UIABLE_BIND:-127.0.0.1}
+      UIABLE_PORT: ${UIABLE_PORT:-8080}
+      UIABLE_DOCKER_VOLUMES: ${UIABLE_DOCKER_VOLUMES:-/var/lib/docker/volumes}   # host path, seen under /host, used for one-time migration
+    volumes:
+      - uiable-data:/data                              # accounts, sessions, layouts (fixed volume name: see below)
+      - /:/host:rbind                                  # host filesystem (rbind so /tmp,/run, etc. are visible)
+      - /var/run/docker.sock:/var/run/docker.sock      # Docker management
+      - /dev:/dev                                      # host devices, so terminal PTYs live in the host's /dev/pts
+    logging:
+      driver: json-file
+      options: { max-size: "5m", max-file: "2" }
+
+volumes:
+  # Fixed name, so the same volume is used no matter which folder or compose
+  # project name Uiable is started from. Older releases used the project-scoped
+  # name <folder>_uiable-data (e.g. uiable_uiable-data); on first start with an
+  # empty volume, Uiable copies data from such an older volume automatically.
+  uiable-data:
+    name: uiable-data

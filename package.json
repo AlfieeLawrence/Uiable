@@ -1,0 +1,25 @@
+{
+  "name": "uiable",
+  "version": "1.1.3",
+  "description": "Self-hosted Umbrel-style Linux server dashboard: stats, files, terminal, Docker, app store, alerts, 2FA, roles and more.",
+  "main": "server/index.js",
+  "private": true,
+  "scripts": {
+    "start": "node server/index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@xterm/addon-fit": "^0.10.0",
+    "@xterm/xterm": "^5.5.0",
+    "bcryptjs": "^2.4.3",
+    "busboy": "^1.6.0",
+    "express": "^4.21.2",
+    "js-yaml": "^4.3.2",
+    "node-pty": "^1.0.0",
+    "nodemailer": "^6.10.1",
+    "qrcode": "^1.5.4",
+    "ws": "^8.18.0"
+  }
+}
