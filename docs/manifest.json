@@ -1,6 +1,6 @@
 {
   "name": "Uiable",
-  "versionHint": "1.2.0",
+  "versionHint": "1.2.1",
   "repository": "https://github.com/AlfieeLawrence/uiable",
   "releases": "https://github.com/AlfieeLawrence/uiable/releases",
   "companion": "https://github.com/AlfieeLawrence/Uiable-Connect",
@@ -40,6 +40,13 @@
       "order": 20,
       "slug": "security",
       "path": "docs/security.md"
+    },
+    {
+      "title": "Files",
+      "description": "Host file manager with drag-and-drop upload, editor, and optional sudo for root paths.",
+      "order": 25,
+      "slug": "files",
+      "path": "docs/files.md"
     },
     {
       "title": "Metrics history",

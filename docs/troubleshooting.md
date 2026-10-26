@@ -16,3 +16,8 @@ slug: troubleshooting
 | Lost accounts after move | Data is in volume `uiable-data` — see README recover section |
 
 More: [Connect troubleshooting](https://github.com/AlfieeLawrence/Uiable-Connect/blob/main/docs/troubleshooting.md)
+
+## Files: permission denied
+
+Tick **Use sudo** in Files (or **Save as sudo** in the editor) and enter the host sudo password when prompted. It stays in memory for the session and is never written to the audit log. If sudo is passwordless on the host (`sudo -n`), no password is needed.
+

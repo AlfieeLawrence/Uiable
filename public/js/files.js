@@ -30,6 +30,24 @@ async function filesFromDrop(dt) {
   return out;
 }
 
+
+async function filesSudoSaved() {
+  try { return !!(await GET('/files/sudo')).saved; } catch (_) { return false; }
+}
+async function ensureFilesSudoPw() {
+  if (await filesSudoSaved()) return true;
+  // Probe: try passwordless by asking user only when needed — prompt first.
+  const r = await formDlg('sudo password', [
+    { name: 'password', label: 'Host sudo password', type: 'password', placeholder: 'Saved for this browser session only' },
+    { name: 'remember', type: 'checkbox', label: 'Keep for this session', checked: true },
+  ], 'Save', { intro: 'Needed to browse or edit paths your user cannot access. Never written to the audit log.' });
+  if (!r || !r.password) return false;
+  await POST('/files/sudo', { password: r.password });
+  toast('sudo password saved for this session');
+  return true;
+}
+function sudoQS(on) { return on ? '&sudo=1' : ''; }
+
 const Uploads = {
   el: null,
   show(text, pct) {
@@ -39,12 +57,12 @@ const Uploads = {
   hide() { if (this.el) { this.el.remove(); this.el = null; } },
 };
 
-function uploadBatch(dir, batch, overwrite, onProgress) {
+function uploadBatch(dir, batch, overwrite, onProgress, useSudo) {
   return new Promise((resolve, reject) => {
     const fd = new FormData();
     batch.forEach((b) => fd.append('files', b.file, b.path));
     const xhr = new XMLHttpRequest();
-    xhr.open('POST', `/api/files/upload?path=${encodeURIComponent(dir)}${overwrite ? '&overwrite=1' : ''}`);
+    xhr.open('POST', `/api/files/upload?path=${encodeURIComponent(dir)}${overwrite ? '&overwrite=1' : ''}${useSudo ? '&sudo=1' : ''}`);
     xhr.setRequestHeader('X-CSRF-Token', State.csrf || '');
     xhr.upload.onprogress = (e) => { if (e.lengthComputable) onProgress(e.loaded); };
     xhr.onload = () => { let d = {}; try { d = JSON.parse(xhr.responseText); } catch (_) {} if (xhr.status < 300) resolve(d); else reject(new ApiError(d.error || `Upload failed (${xhr.status})`, xhr.status, d)); };
@@ -53,7 +71,7 @@ function uploadBatch(dir, batch, overwrite, onProgress) {
   });
 }
 
-async function uploadAll(dir, entries, existing) {
+async function uploadAll(dir, entries, existing, useSudo) {
   const files = entries.filter((e) => e.file);
   const dirs = entries.filter((e) => e.dir);
   if (!files.length && !dirs.length) return false;
@@ -75,7 +93,7 @@ async function uploadAll(dir, entries, existing) {
   try {
     for (const b of batches) {
       const bs = b.reduce((a, f) => a + f.file.size, 0);
-      await uploadBatch(dir, b, overwrite, (loaded) => Uploads.show(`Uploading ${files.length} file${files.length === 1 ? '' : 's'}…`, ((sent + Math.min(loaded, bs)) / total) * 100));
+      await uploadBatch(dir, b, overwrite, (loaded) => Uploads.show(`Uploading ${files.length} file${files.length === 1 ? '' : 's'}…`, ((sent + Math.min(loaded, bs)) / total) * 100), useSudo);
       sent += bs;
     }
     Uploads.hide();
@@ -84,35 +102,58 @@ async function uploadAll(dir, entries, existing) {
   return true;
 }
 
-async function openEditor(path, onSaved) {
+async function openEditor(path, onSaved, useSudo) {
   let r;
-  try { r = await GET(`/files/read?path=${encodeURIComponent(path)}`); } catch (e) {
-    if (await confirmDlg('Cannot edit this file', `${esc(e.message)}. Download it instead?`, { okLabel: 'Download' })) downloadPath(path);
+  const sudo = !!useSudo;
+  try { r = await GET(`/files/read?path=${encodeURIComponent(path)}${sudoQS(sudo)}`); } catch (e) {
+    if (await confirmDlg('Cannot edit this file', `${esc(e.message)}. Download it instead?`, { okLabel: 'Download' })) downloadPath(path, sudo);
     return;
   }
   let dirty = false;
-  const save = async (m) => { await POST('/files/write', { path, content: $('textarea', m).value }); dirty = false; toast('Saved ' + path.split('/').pop()); if (onSaved) onSaved(); return false; };
+  const save = async (m, asSudo) => {
+    await POST('/files/write', { path, content: $('textarea', m).value, sudo: !!asSudo });
+    dirty = false; toast((asSudo ? 'Saved with sudo: ' : 'Saved ') + path.split('/').pop()); if (onSaved) onSaved(); return false;
+  };
   await modal({
     title: path, full: true, dismissable: false,
     body: `<textarea class="editor" spellcheck="false"></textarea>`,
-    buttons: [{ label: 'Close', value: null }, { label: 'Save  (Ctrl+S)', cls: 'primary', handler: save, keepOpenOnError: true }],
+    buttons: [
+      { label: 'Close', value: null },
+      { label: 'Save as sudo', handler: async (m) => { if (!(await ensureFilesSudoPw())) return false; return save(m, true); }, keepOpenOnError: true },
+      { label: 'Save  (Ctrl+S)', cls: 'primary', handler: (m) => save(m, false), keepOpenOnError: true },
+    ],
     onOpen: (m, close) => {
       const ta = $('textarea', m); ta.value = r.content;
       ta.oninput = () => { dirty = true; };
       ta.onkeydown = (e) => {
         if (e.key === 'Tab') { e.preventDefault(); const s = ta.selectionStart; ta.setRangeText('\t', s, ta.selectionEnd, 'end'); dirty = true; }
-        if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') { e.preventDefault(); act(null, () => save(m)); }
+        if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 's') { e.preventDefault(); act(null, () => save(m, false)); }
       };
       const x = $('[data-x]', m); const closeBtn = $('footer button[data-i="0"]', m);
       const guarded = async () => { if (!dirty || await confirmDlg('Discard changes?', 'You have unsaved changes.', { okLabel: 'Discard', danger: true })) close(null); };
       x.onclick = guarded; closeBtn.onclick = guarded;
+      // Split-style: turn "Save as sudo" + Save into a dropdown beside Save
+      const footer = $('footer', m);
+      const sudoBtn = footer && footer.querySelector('button[data-i="1"]');
+      const saveBtn = footer && footer.querySelector('button[data-i="2"]');
+      if (sudoBtn && saveBtn) {
+        const wrap = document.createElement('div'); wrap.className = 'split-btn';
+        const caret = document.createElement('button'); caret.type = 'button'; caret.className = 'primary split-caret'; caret.title = 'More save options'; caret.textContent = '▾';
+        const menu = document.createElement('div'); menu.className = 'split-menu hidden';
+        sudoBtn.classList.remove('hidden');
+        menu.appendChild(sudoBtn);
+        saveBtn.replaceWith(wrap);
+        wrap.appendChild(saveBtn); wrap.appendChild(caret); wrap.appendChild(menu);
+        caret.onclick = (e) => { e.stopPropagation(); menu.classList.toggle('hidden'); };
+        m.addEventListener('click', (e) => { if (!e.target.closest('.split-btn')) menu.classList.add('hidden'); });
+      }
     },
   });
 }
 
-function downloadPath(p) {
+function downloadPath(p, useSudo) {
   const a = document.createElement('a');
-  a.href = `/api/files/download?path=${encodeURIComponent(p)}`;
+  a.href = `/api/files/download?path=${encodeURIComponent(p)}${sudoQS(!!useSudo)}`;
   a.download = '';
   document.body.appendChild(a); a.click(); a.remove();
 }
@@ -143,7 +184,7 @@ async function chmodDlg(item, path, reload) {
 Pages.files = (el, params) => {
   let cwd = params.length ? params.join('/') : (localStorage.getItem('uiable-cwd') || '/');
   if (!cwd.startsWith('/')) cwd = '/' + cwd;
-  let items = []; let selected = new Set(); let showHidden = localStorage.getItem('uiable-hidden') === '1'; let filter = '';
+  let items = []; let selected = new Set(); let showHidden = localStorage.getItem('uiable-hidden') === '1'; let useSudo = localStorage.getItem('uiable-files-sudo') === '1'; let filter = '';
   let sort = { key: 'name', dir: 1 };
   el.innerHTML = `<div class="toolbar">
       <button class="icon" data-up title="Up one level">${ICON.up}</button>
@@ -155,12 +196,13 @@ Pages.files = (el, params) => {
       <button data-mkdir>${ICON.folderPlus} New folder</button><button data-touch>${ICON.plus} New file</button>
       <span data-selactions class="row hidden"><span class="muted small" data-selcount></span><button class="sm" data-dlsel>${ICON.download} Download</button><button class="sm danger" data-delsel>${ICON.trash} Delete</button></span>
       <div class="spacer"></div><input class="search" placeholder="Filter this folder…" style="max-width:200px">
+      <label class="row small"><input type="checkbox" data-sudo> Use sudo</label>
       <label class="row small"><input type="checkbox" data-hidden ${showHidden ? 'checked' : ''}> Hidden files</label>
       <input type="file" multiple data-file class="hidden"><input type="file" multiple webkitdirectory data-dir class="hidden">
     </div>
     <div class="card flush dropzone" data-drop><div class="table-wrap"><table><thead><tr><th style="width:34px"><input type="checkbox" data-all></th>
       <th class="sortable" data-sort="name">Name</th><th class="sortable right" data-sort="size">Size</th><th class="sortable hide-sm" data-sort="mtime">Modified</th><th class="hide-sm">Permissions</th><th class="hide-sm">Owner</th><th></th></tr></thead><tbody></tbody></table></div></div>
-    <p class="muted small" style="margin-top:10px">Tip: drag files or whole folders onto the list to upload. Double-click a file to edit it (including dotfiles like .bashrc once Hidden files is checked). Saves keep the original owner, group and mode.</p>`;
+    <p class="muted small" style="margin-top:10px">Tip: drag files or whole folders onto the list to upload. Tick <b>Use sudo</b> to browse/upload/view paths that need root (uses a session sudo password). In the editor, use the Save ▾ menu for <b>Save as sudo</b>. Normal saves keep the original owner, group and mode.</p>`;
   const tbody = $('tbody', el);
 
   const visible = () => {
@@ -195,7 +237,8 @@ Pages.files = (el, params) => {
   }
   async function load(path = cwd, quiet) {
     try {
-      const r = await GET(`/files/list?path=${encodeURIComponent(path)}`);
+      if (useSudo && !(await ensureFilesSudoPw())) { useSudo = false; localStorage.setItem('uiable-files-sudo', '0'); const cb = $('[data-sudo]', el); if (cb) cb.checked = false; }
+      const r = await GET(`/files/list?path=${encodeURIComponent(path)}${sudoQS(useSudo)}`);
       cwd = r.path; items = r.items; if (!quiet) selected.clear();
       localStorage.setItem('uiable-cwd', cwd);
       history.replaceState(null, '', '#/files' + cwd.split('/').map(encodeURIComponent).join('/'));
@@ -212,8 +255,8 @@ Pages.files = (el, params) => {
   async function openItem(i) {
     const p = joinPath(cwd, i.name);
     if (i.type === 'dir' || i.targetDir) return go(p);
-    if (i.size > 5 * 1024 * 1024) return downloadPath(p);
-    openEditor(p, reload);
+    if (i.size > 5 * 1024 * 1024) return downloadPath(p, useSudo);
+    openEditor(p, reload, useSudo);
   }
   async function rename(i) {
     const r = await formDlg('Rename', [{ name: 'name', label: 'New name', value: i.name }], 'Rename');
@@ -245,7 +288,7 @@ Pages.files = (el, params) => {
     m.onclick = (e) => {
       const b = e.target.closest('[data-m]'); if (!b) return; m.remove();
       ({
-        open: () => go(p), edit: () => openEditor(p, reload), dl: () => downloadPath(p), rename: () => rename(i), chmod: () => chmodDlg(i, p, reload), del: () => del([i.name]),
+        open: () => go(p), edit: () => openEditor(p, reload, useSudo), dl: () => downloadPath(p, useSudo), rename: () => rename(i), chmod: () => chmodDlg(i, p, reload), del: () => del([i.name]),
         term: () => { sessionStorage.setItem('uiable-term-cd', p); location.hash = '#/terminal'; },
         copy: () => { navigator.clipboard.writeText(p).then(() => toast('Path copied'), () => toast(p)); },
       })[b.dataset.m]();
@@ -257,18 +300,19 @@ Pages.files = (el, params) => {
   $('[data-refresh]', el).onclick = reload;
   $('[data-crumbs]', el).onclick = (e) => { const a = e.target.closest('[data-go]'); if (a) { e.preventDefault(); go(a.dataset.go); } };
   $('[data-crumbs]', el).addEventListener('keydown', (e) => { if (e.target.matches('[data-pathinput]') && e.key === 'Enter') { const v = e.target.value.trim(); if (v) go(v.startsWith('/') ? v : joinPath(cwd, v)); } });
+  const sudoEl = $('[data-sudo]', el); if (sudoEl) { sudoEl.checked = useSudo; sudoEl.onchange = async (e) => { useSudo = e.target.checked; if (useSudo && !(await ensureFilesSudoPw())) { useSudo = false; e.target.checked = false; } localStorage.setItem('uiable-files-sudo', useSudo ? '1' : '0'); reload(); }; }
   $('[data-hidden]', el).onchange = (e) => { showHidden = e.target.checked; localStorage.setItem('uiable-hidden', showHidden ? '1' : '0'); render(); };
   $('.search', el).oninput = (e) => { filter = e.target.value; render(); };
   $('[data-all]', el).onchange = (e) => { selected = new Set(e.target.checked ? visible().map((i) => i.name) : []); render(); };
   $$('th[data-sort]', el).forEach((th) => (th.onclick = () => { const k = th.dataset.sort; sort = { key: k, dir: sort.key === k ? -sort.dir : (k === 'name' ? 1 : -1) }; render(); }));
   $('[data-mkdir]', el).onclick = async () => { const r = await formDlg('New folder', [{ name: 'name', label: 'Folder name' }], 'Create'); if (r && r.name) { await act(null, () => POST('/files/mkdir', { path: cwd, name: r.name }), 'Folder created'); reload(); } };
-  $('[data-touch]', el).onclick = async () => { const r = await formDlg('New file', [{ name: 'name', label: 'File name' }], 'Create'); if (r && r.name) { const ok = await act(null, () => POST('/files/touch', { path: cwd, name: r.name })); if (ok) { reload(); openEditor(joinPath(cwd, r.name), reload); } } };
+  $('[data-touch]', el).onclick = async () => { const r = await formDlg('New file', [{ name: 'name', label: 'File name' }], 'Create'); if (r && r.name) { const ok = await act(null, () => POST('/files/touch', { path: cwd, name: r.name })); if (ok) { reload(); openEditor(joinPath(cwd, r.name), reload, useSudo); } } };
   $('[data-upload]', el).onclick = () => $('[data-file]', el).click();
   $('[data-upload-dir]', el).onclick = () => $('[data-dir]', el).click();
-  const fromInput = async (inp) => { const list = Array.from(inp.files).map((f) => ({ file: f, path: f.webkitRelativePath || f.name })); inp.value = ''; if (await uploadAll(cwd, list, new Set(items.map((i) => i.name)))) reload(); };
+  const fromInput = async (inp) => { const list = Array.from(inp.files).map((f) => ({ file: f, path: f.webkitRelativePath || f.name })); inp.value = ''; if (useSudo && !(await ensureFilesSudoPw())) return; if (await uploadAll(cwd, list, new Set(items.map((i) => i.name)), useSudo)) reload(); };
   $('[data-file]', el).onchange = (e) => fromInput(e.target);
   $('[data-dir]', el).onchange = (e) => fromInput(e.target);
-  $('[data-dlsel]', el).onclick = () => [...selected].forEach((n, k) => setTimeout(() => downloadPath(joinPath(cwd, n)), k * 400));
+  $('[data-dlsel]', el).onclick = () => [...selected].forEach((n, k) => setTimeout(() => downloadPath(joinPath(cwd, n), useSudo), k * 400));
   $('[data-delsel]', el).onclick = () => del([...selected]);
 
   tbody.addEventListener('click', (e) => {
@@ -289,7 +333,7 @@ Pages.files = (el, params) => {
   dz.addEventListener('drop', async (e) => {
     e.preventDefault(); depth = 0; dz.classList.remove('over');
     const list = await filesFromDrop(e.dataTransfer);
-    if (await uploadAll(cwd, list, new Set(items.map((i) => i.name)))) reload();
+    if (useSudo && !(await ensureFilesSudoPw())) return; if (await uploadAll(cwd, list, new Set(items.map((i) => i.name)), useSudo)) reload();
   });
   const stopNav = (e) => { if (isFiles(e)) e.preventDefault(); };
   window.addEventListener('dragover', stopNav); window.addEventListener('drop', stopNav);

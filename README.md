@@ -16,7 +16,7 @@ Umbrel-style look (app grid, rounded cards, dock, dark/light modes) with Termius
 | --- | --- | --- |
 | **Home** | any | Customisable grid (widgets, app shortcuts, containers, scripts, folders, links) with per-user layout, edit mode, and customisable dock. **All apps** launcher with search. |
 | **Dashboard** | any | Live CPU / RAM / disk / network / temps / uptime over websocket (only while a client is connected). Storage card uses the largest real disk (or a Settings-chosen primary mount) — important on Umbrel/rugix where `/` and config are tiny. |
-| **Files** | viewer+ | Browse the host, drag-and-drop upload (files and folders), download, rename, delete, chmod, text editor. Dotfiles via "Hidden files". Saves keep owner/group/mode and preserve symlinks. |
+| **Files** | viewer+ | Browse the host, drag-and-drop upload (files and folders), download, rename, delete, chmod, text editor. Dotfiles via "Hidden files". **Use sudo** + **Save as sudo** for root-only paths (session sudo password). Normal saves keep owner/group/mode and preserve symlinks. |
 | **App store** | viewer / op+ | One-click install of Jellyfin, Pi-hole, Nextcloud, Home Assistant, Uptime Kuma, Vaultwarden, Portainer, Syncthing as compose stacks. Configurable ports/volumes; warns on port 80 conflicts (Umbrel). |
 | **Stacks** | viewer / op+ | List, create, edit YAML, validate, up / down / pull, logs. Includes app-store stacks. |
 | **Docker** | viewer / op+ | Containers, images, volumes: start/stop/restart/remove, logs, stats, prune. |
