@@ -1,6 +1,6 @@
 'use strict';
-// Persistent metrics history (SQLite via node:sqlite). Default retain 7 days; dashboard-controllable.
-// Migrates legacy DATA_DIR/metrics/*.jsonl on first open.
+// Persistent metrics history. Prefer SQLite via node:sqlite (Node 22.5+ / 26);
+// fall back to JSONL under DATA_DIR/metrics if sqlite is unavailable so boot never crashes.
 const express = require('express');
 const fs = require('fs');
 const fsp = fs.promises;
@@ -16,6 +16,7 @@ let DIR = null;
 let DB_PATH = null;
 let SETTINGS_PATH = null;
 let db = null;
+let backend = 'none'; // 'sqlite' | 'jsonl' | 'none'
 let timer = null;
 let lastSample = 0;
 let settings = { retainDays: 7, intervalSec: 60 };
@@ -29,7 +30,6 @@ function loadSettings() {
     if (s.retainDays != null) settings.retainDays = Math.max(1, Math.min(90, Number(s.retainDays) || 7));
     if (s.intervalSec != null) settings.intervalSec = Math.max(15, Math.min(3600, Number(s.intervalSec) || 60));
   } catch (_) {}
-  // env override only if settings file missing retain
   if (!fs.existsSync(SETTINGS_PATH) && process.env.UIABLE_METRICS_DAYS) {
     settings.retainDays = Math.max(1, Number(process.env.UIABLE_METRICS_DAYS) || 7);
   }
@@ -40,22 +40,39 @@ function saveSettings() {
   fs.renameSync(tmp, SETTINGS_PATH);
 }
 
+function dayFile(ms) {
+  const d = new Date(ms);
+  const y = d.getUTCFullYear();
+  const m = String(d.getUTCMonth() + 1).padStart(2, '0');
+  const day = String(d.getUTCDate()).padStart(2, '0');
+  return path.join(DIR, `${y}-${m}-${day}.jsonl`);
+}
+
 function openDb() {
-  const { DatabaseSync } = require('node:sqlite');
-  db = new DatabaseSync(DB_PATH);
-  db.exec(`
-    PRAGMA journal_mode = WAL;
-    CREATE TABLE IF NOT EXISTS samples (
-      t INTEGER PRIMARY KEY,
-      cpu REAL, mem REAL, disk REAL, rx REAL, tx REAL,
-      temp REAL, gpu REAL, load1 REAL
-    );
-    CREATE INDEX IF NOT EXISTS idx_samples_t ON samples(t);
-  `);
+  try {
+    const { DatabaseSync } = require('node:sqlite');
+    db = new DatabaseSync(DB_PATH);
+    db.exec(`
+      PRAGMA journal_mode = WAL;
+      CREATE TABLE IF NOT EXISTS samples (
+        t INTEGER PRIMARY KEY,
+        cpu REAL, mem REAL, disk REAL, rx REAL, tx REAL,
+        temp REAL, gpu REAL, load1 REAL
+      );
+      CREATE INDEX IF NOT EXISTS idx_samples_t ON samples(t);
+    `);
+    backend = 'sqlite';
+    return true;
+  } catch (e) {
+    console.warn('[metrics] node:sqlite unavailable (' + (e && e.message) + '); using JSONL fallback');
+    db = null;
+    backend = 'jsonl';
+    return false;
+  }
 }
 
 async function migrateJsonl() {
-  if (!DIR || !db) return { imported: 0 };
+  if (!DIR || !db || backend !== 'sqlite') return { imported: 0 };
   let names = [];
   try { names = (await fsp.readdir(DIR)).filter((n) => n.endsWith('.jsonl')); } catch (_) { return { imported: 0 }; }
   let imported = 0;
@@ -85,10 +102,20 @@ function init(dataDir) {
   SETTINGS_PATH = path.join(DIR, 'settings.json');
   fs.mkdirSync(DIR, { recursive: true, mode: 0o700 });
   loadSettings();
-  openDb();
-  migrateJsonl().then((r) => { if (r.imported) console.log('[metrics] migrated', r.imported, 'jsonl samples → sqlite'); }).catch(() => {});
+  try {
+    openDb();
+  } catch (e) {
+    console.warn('[metrics] init openDb failed:', e && e.message);
+    db = null;
+    backend = 'jsonl';
+  }
+  if (backend === 'sqlite') {
+    migrateJsonl().then((r) => { if (r.imported) console.log('[metrics] migrated', r.imported, 'jsonl samples → sqlite'); }).catch(() => {});
+  } else {
+    console.log('[metrics] backend=jsonl dir=' + DIR);
+  }
   start();
-  prune();
+  try { prune(); } catch (e) { console.warn('[metrics] prune:', e && e.message); }
 }
 
 function start() {
@@ -100,7 +127,7 @@ function stop() { if (timer) { clearInterval(timer); timer = null; } }
 
 function sample() {
   return (async () => {
-    if (!db) return;
+    if (backend === 'none') return;
     const now = Date.now();
     if (now - lastSample < INTERVAL_MS() * 0.8) return;
     lastSample = now;
@@ -124,22 +151,64 @@ function sample() {
       if (pd.percent != null) row.disk = Number(pd.percent);
       else if (pd.used != null && pd.size) row.disk = (Number(pd.used) / Number(pd.size)) * 100;
     }
-    db.prepare('INSERT OR REPLACE INTO samples (t,cpu,mem,disk,rx,tx,temp,gpu,load1) VALUES (?,?,?,?,?,?,?,?,?)')
-      .run(row.t, row.cpu, row.mem, row.disk, row.rx, row.tx, row.temp, row.gpu, row.load1);
+    if (backend === 'sqlite' && db) {
+      db.prepare('INSERT OR REPLACE INTO samples (t,cpu,mem,disk,rx,tx,temp,gpu,load1) VALUES (?,?,?,?,?,?,?,?,?)')
+        .run(row.t, row.cpu, row.mem, row.disk, row.rx, row.tx, row.temp, row.gpu, row.load1);
+    } else if (backend === 'jsonl') {
+      await fsp.appendFile(dayFile(now), JSON.stringify(row) + '\n', { mode: 0o600 });
+    }
   })();
 }
 
 function prune() {
-  if (!db) return { deleted: 0 };
-  const cutoff = Date.now() - RETAIN_DAYS() * 86400 * 1000;
-  const info = db.prepare('DELETE FROM samples WHERE t < ?').run(cutoff);
-  return { deleted: info.changes || 0, cutoff, retainDays: RETAIN_DAYS() };
+  if (backend === 'sqlite' && db) {
+    const cutoff = Date.now() - RETAIN_DAYS() * 86400 * 1000;
+    const info = db.prepare('DELETE FROM samples WHERE t < ?').run(cutoff);
+    return { deleted: info.changes || 0, cutoff, retainDays: RETAIN_DAYS() };
+  }
+  if (backend === 'jsonl' && DIR) {
+    const cutoff = Date.now() - RETAIN_DAYS() * 86400 * 1000;
+    let deleted = 0;
+    let names = [];
+    try { names = fs.readdirSync(DIR).filter((n) => n.endsWith('.jsonl')); } catch (_) { return { deleted: 0 }; }
+    for (const n of names) {
+      const m = /^(\d{4})-(\d{2})-(\d{2})\.jsonl$/.exec(n);
+      if (!m) continue;
+      const dayMs = Date.UTC(+m[1], +m[2] - 1, +m[3]);
+      if (dayMs + 86400000 < cutoff) {
+        try { fs.unlinkSync(path.join(DIR, n)); deleted += 1; } catch (_) {}
+      }
+    }
+    return { deleted, cutoff, retainDays: RETAIN_DAYS() };
+  }
+  return { deleted: 0 };
+}
+
+function readRangeJsonl(fromMs, toMs) {
+  const rows = [];
+  let names = [];
+  try { names = fs.readdirSync(DIR).filter((n) => n.endsWith('.jsonl')).sort(); } catch (_) { return rows; }
+  for (const n of names) {
+    let text = '';
+    try { text = fs.readFileSync(path.join(DIR, n), 'utf8'); } catch (_) { continue; }
+    for (const line of text.split('\n')) {
+      if (!line) continue;
+      let row; try { row = JSON.parse(line); } catch (_) { continue; }
+      if (!row.t || row.t < fromMs || row.t > toMs) continue;
+      rows.push(row);
+    }
+  }
+  rows.sort((a, b) => a.t - b.t);
+  return rows;
 }
 
 function readRange(fromMs, toMs) {
-  if (!db) return [];
-  return db.prepare('SELECT t,cpu,mem,disk,rx,tx,temp,gpu,load1 FROM samples WHERE t >= ? AND t <= ? ORDER BY t ASC')
-    .all(fromMs, toMs);
+  if (backend === 'sqlite' && db) {
+    return db.prepare('SELECT t,cpu,mem,disk,rx,tx,temp,gpu,load1 FROM samples WHERE t >= ? AND t <= ? ORDER BY t ASC')
+      .all(fromMs, toMs);
+  }
+  if (backend === 'jsonl') return readRangeJsonl(fromMs, toMs);
+  return [];
 }
 
 function downsample(rows, maxPoints) {
@@ -159,16 +228,19 @@ router.get('/history', wrap(async (req, res) => {
   const rows = downsample(readRange(fromMs, toMs), maxPoints);
   res.json({
     from: fromMs, to: toMs, hours, points: rows.length,
-    retainDays: RETAIN_DAYS(), intervalSec: INTERVAL_MS() / 1000, backend: 'sqlite',
+    retainDays: RETAIN_DAYS(), intervalSec: INTERVAL_MS() / 1000, backend,
     samples: rows,
   });
 }));
 
 router.get('/status', wrap(async (req, res) => {
   let count = 0;
-  try { count = db.prepare('SELECT COUNT(*) AS c FROM samples').get().c; } catch (_) {}
+  try {
+    if (backend === 'sqlite' && db) count = db.prepare('SELECT COUNT(*) AS c FROM samples').get().c;
+    else if (backend === 'jsonl') count = readRangeJsonl(0, Date.now()).length;
+  } catch (_) {}
   res.json({
-    ok: true, backend: 'sqlite', samples: count,
+    ok: true, backend, samples: count,
     retainDays: RETAIN_DAYS(), intervalSec: INTERVAL_MS() / 1000, lastSample, db: DB_PATH,
   });
 }));

@@ -1,6 +1,6 @@
 {
   "name": "uiable",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "description": "Self-hosted Umbrel-style Linux server dashboard: stats, files, terminal, Docker, app store, alerts, 2FA, roles and more.",
   "main": "server/index.js",
   "private": true,
@@ -9,7 +9,7 @@
     "start": "node server/index.js"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=26"
   },
   "dependencies": {
     "@xterm/addon-fit": "^0.10.0",

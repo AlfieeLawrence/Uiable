@@ -2,7 +2,7 @@
 # Uiable - self-hosted server dashboard. Multi-arch: builds natively on amd64, arm64, armv7, ...
 # (node-pty is compiled from source for whatever platform the image is built on).
 
-FROM node:20-bookworm-slim AS build
+FROM node:26-bookworm-slim AS build
 WORKDIR /app
 RUN apt-get update \
  && apt-get install -y --no-install-recommends python3 make g++ \
@@ -10,7 +10,7 @@ RUN apt-get update \
 COPY package.json package-lock.json BUILD_INFO.json ./
 RUN npm ci --omit=dev --no-audit --no-fund
 
-FROM node:20-bookworm-slim
+FROM node:26-bookworm-slim
 # util-linux: nsenter. procps: fallback ps. tar: folder downloads.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends util-linux procps tar ca-certificates \
