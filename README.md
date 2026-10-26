@@ -8,14 +8,14 @@ Umbrel-style look (app grid, rounded cards, dock, dark/light modes) with Termius
 
 **Download:** grab `uiable.zip` from the [latest release](https://github.com/AlfieeLawrence/uiable/releases/latest).
 
-**Docs (website-ready):** see [`docs/`](docs/) — start at [`docs/README.md`](docs/README.md); machine index [`docs/manifest.json`](docs/manifest.json).
+**Docs (website-ready):** see [`docs/`](docs/) â€” start at [`docs/README.md`](docs/README.md); machine index [`docs/manifest.json`](docs/manifest.json).
 
 ## Features
 
 | App | Who | What |
 | --- | --- | --- |
 | **Home** | any | Customisable grid (widgets, app shortcuts, containers, scripts, folders, links) with per-user layout, edit mode, and customisable dock. **All apps** launcher with search. |
-| **Dashboard** | any | Live CPU / RAM / disk / network / temps / uptime over websocket (only while a client is connected). Storage card uses the largest real disk (or a Settings-chosen primary mount) — important on Umbrel/rugix where `/` and config are tiny. |
+| **Dashboard** | any | Live CPU / RAM / disk / network / temps / uptime over websocket (only while a client is connected). Storage card uses the largest real disk (or a Settings-chosen primary mount) â€” important on Umbrel/rugix where `/` and config are tiny. |
 | **Files** | viewer+ | Browse the host, drag-and-drop upload (files and folders), download, rename, delete, chmod, text editor. Dotfiles via "Hidden files". **Use sudo** + **Save as sudo** for root-only paths (session sudo password). Normal saves keep owner/group/mode and preserve symlinks. |
 | **App store** | viewer / op+ | One-click install of Jellyfin, Pi-hole, Nextcloud, Home Assistant, Uptime Kuma, Vaultwarden, Portainer, Syncthing as compose stacks. Configurable ports/volumes; warns on port 80 conflicts (Umbrel). |
 | **Stacks** | viewer / op+ | List, create, edit YAML, validate, up / down / pull, logs. Includes app-store stacks. |
@@ -34,9 +34,9 @@ Umbrel-style look (app grid, rounded cards, dock, dark/light modes) with Termius
 
 ### Roles (enforced server-side)
 
-- **admin** — full access (users, settings, terminal, power, firewall, updates, proxy, audit, alerts).
-- **operator** — Docker, services, stacks, app store install, files write, net tools. No users / settings / terminal / power.
-- **viewer** — read-only (dashboard, lists, logs, downloads).
+- **admin** â€” full access (users, settings, terminal, power, firewall, updates, proxy, audit, alerts).
+- **operator** â€” Docker, services, stacks, app store install, files write, net tools. No users / settings / terminal / power.
+- **viewer** â€” read-only (dashboard, lists, logs, downloads).
 
 ### Auth
 
@@ -126,7 +126,7 @@ Uiable is effectively **root on the host** (`privileged`, `pid: host`, `uts: hos
 
 ## Update
 
-The zip contains a top-level `uiable/` folder. Always start with `docker compose up -d --build` so the image (`uiable:local`) is rebuilt from the source you just unpacked; the running version and build date are shown in **Settings → About** and at the bottom of the home screen.
+The zip contains a top-level `uiable/` folder. Always start with `docker compose up -d --build` so the image (`uiable:local`) is rebuilt from the source you just unpacked; the running version and build date are shown in **Settings â†’ About** and at the bottom of the home screen.
 
 
 From a normal SSH session (foreground), in the install folder:
@@ -170,6 +170,7 @@ install.sh      Docker-aware installer (Umbrel-friendly)
 
 ## Changelog
 
+- **1.2.3** - Fix boot crash: /api/health registered on `api` before the router was declared (TDZ `ReferenceError` / Restarting (1)). Route is now on `app` as public liveness.
 - **1.2.0** - Metrics history (SQLite, 7-day default retention), themes, MIT LICENSE, audit secret redaction, encrypted secrets (OpenSSL AES-256-CBC PBKDF2), self-updater with checksum/health/rollback, backups/WireGuard/integrity, alerts (webhook/Discord/ntfy + history), API token scopes/expiry, RAID/ZFS safe actions, fail2ban, Podman socket, GPU/cpuTemp stats, GitHub Release CI, structured docs.
-- **1.1.3** - Removed the non-working "Done" button from the script run/output dialog (Close stays). Long script names in the Scripts list and editor header now truncate with "…" and scroll on hover (the list row was overflowing its card).
+- **1.1.3** - Removed the non-working "Done" button from the script run/output dialog (Close stays). Long script names in the Scripts list and editor header now truncate with "â€¦" and scroll on hover (the list row was overflowing its card).
 - **1.1.2** - Scripts and terminals run outside the dashboard 256M memory limit (systemd-run scope, else cgroup move), so big builds like `pnpm build` are no longer "Killed". Scripts now run like an SSH session: your login shell with ~/.profile, ~/.bash_profile and ~/.bashrc loaded (nvm, pnpm, ~/.local/bin, aliases).

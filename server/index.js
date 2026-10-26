@@ -53,7 +53,8 @@ app.use((req, res, next) => {
 
 const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
 
-api.get('/health', (req, res) => res.json({ ok: true, ts: Date.now() }));
+// Public liveness (on app: unauthenticated, and api Router is declared later)
+app.get('/api/health', (req, res) => res.json({ ok: true, ts: Date.now() }));
 
 // ------------------------------------------------------------- public auth
 app.get('/api/state', (req, res) => {
