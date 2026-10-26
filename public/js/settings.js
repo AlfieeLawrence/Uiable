@@ -3,7 +3,7 @@
 const SECTIONS = [
   ['account', 'My account', 'users', 'viewer'],
   ['general', 'General', 'settings', 'admin'], ['network', 'Network & Wi-Fi', 'wifi', 'admin'], ['users', 'Linux users', 'users', 'admin'],
-  ['accounts', 'Dashboard accounts', 'key', 'admin'], ['security', 'Security & 2FA', 'lock', 'viewer'], ['alerts', 'Alerts', 'info', 'admin'],
+  ['accounts', 'Dashboard accounts', 'key', 'admin'], ['security', 'Security & 2FA', 'lock', 'viewer'], ['alerts', 'Alerts', 'info', 'admin'], ['tokens', 'API tokens', 'key', 'admin'],
   ['appearance', 'Appearance', 'palette', 'viewer'], ['power', 'Power', 'power', 'admin'], ['about', 'About & security', 'shield', 'viewer'],
 ].filter((s) => can(s[3]));
 
@@ -253,8 +253,12 @@ Settings.accounts = async (b) => {
 
 Settings.appearance = (b) => {
   const cur = getTheme();
-  b.innerHTML = `<div class="card"><div class="card-title">${ICON.palette} Theme</div><div class="seg">${['system', 'light', 'dark'].map((t) => `<button data-t="${t}" class="${t === cur ? 'active' : ''}">${t[0].toUpperCase() + t.slice(1)}</button>`).join('')}</div>
-    <p class="muted small" style="margin-top:12px">Saved in this browser.</p></div>`;
+  const opts = ['system', ...APP_THEMES];
+  const label = (t) => t[0].toUpperCase() + t.slice(1);
+  b.innerHTML = `<div class="card"><div class="card-title">${ICON.palette} Theme</div>
+    <p class="muted small" style="margin:0 0 10px">Applies to the whole dashboard (same palettes as Uiable Connect).</p>
+    <div class="seg" style="flex-wrap:wrap">${opts.map((t) => `<button data-t="${t}" class="${t === cur ? 'active' : ''}">${label(t)}</button>`).join('')}</div>
+    <p class="muted small" style="margin-top:12px">Saved in this browser. <span class="mono">system</span> follows your OS light/dark preference.</p></div>`;
   b.onclick = (e) => { const x = e.target.closest('[data-t]'); if (x) { setTheme(x.dataset.t); $$('[data-t]', b).forEach((y) => y.classList.toggle('active', y === x)); } };
 };
 
@@ -335,84 +339,154 @@ Settings.security = async (b) => {
 
 Settings.alerts = async (b) => {
   const s = await GET('/alerts');
-  b.innerHTML = `<div class="card section"><div class="card-title">${ICON.info} Alerts <span class="chip ${s.running ? 'ok' : ''}">${s.running ? 'loop running' : 'idle'}</span></div>
-    <p class="muted">Checks about every 60 seconds, but only while at least one channel is configured and alerts are enabled. Cooldown prevents spam.</p>
+  const ch = s.channels || {};
+  const email = ch.email || {}, tg = ch.telegram || {}, wh = ch.webhook || {}, dc = ch.discord || {}, nt = ch.ntfy || {};
+  b.innerHTML = `<div class="card section"><div class="card-title">${ICON.info} Alerts <span class="chip ${s.running ? 'ok' : ''}">${s.running ? 'running' : 'idle'}</span></div>
+    <p class="muted">Checks about every 60 seconds when enabled and at least one channel is configured.</p>
     <label class="row"><input type="checkbox" data-en ${s.enabled ? 'checked' : ''}> Enable alerts</label>
-    <label class="field" style="margin-top:10px"><span>Cooldown minutes</span><input data-cd type="number" value="${s.cooldownMinutes}" style="max-width:120px"></label></div>
-    <div class="card section"><div class="card-title">Rules</div>
-      ${['cpu','mem','disk','temp'].map((k) => { const r = s.rules[k]; return `<div class="list-item"><label class="row"><input type="checkbox" data-r="${k}" ${r.enabled ? 'checked' : ''}> ${k.toUpperCase()} above</label>
-        <input data-v="${k}" type="number" value="${r.above}" style="width:80px"> %
-        ${r.forMinutes != null ? ` for <input data-for="${k}" type="number" value="${r.forMinutes}" style="width:60px"> min` : ''}</div>`; }).join('')}
-      <div class="list-item"><label class="row"><input type="checkbox" data-r="containerDown" ${s.rules.containerDown.enabled ? 'checked' : ''}> Container went down</label>
-        <input data-ctrs placeholder="names (blank = any previously seen)" value="${esc((s.rules.containerDown.names || []).join(', '))}" style="flex:1"></div></div>
-    <div class="card section"><div class="card-title">Email (SMTP)</div>
-      <label class="row"><input type="checkbox" data-eon ${s.channels.email.enabled ? 'checked' : ''}> Enable email</label>
-      <div class="grid cols-2" style="margin-top:10px">
-        <label class="field"><span>SMTP host</span><input data-ehost value="${esc(s.channels.email.host)}"></label>
-        <label class="field"><span>Port</span><input data-eport type="number" value="${s.channels.email.port}"></label>
-        <label class="field"><span>Username</span><input data-euser value="${esc(s.channels.email.user)}"></label>
-        <label class="field"><span>Password</span><input data-epass type="password" value="${esc(s.channels.email.pass)}" placeholder="unchanged if blank"></label>
-        <label class="field"><span>From</span><input data-efrom value="${esc(s.channels.email.from)}"></label>
-        <label class="field"><span>To</span><input data-eto value="${esc(s.channels.email.to)}"></label>
+    <label>Cooldownoldown (minutes)<input type="number" data-cd value="${esc(String(s.cooldownMinutes || 30))}"></label>
+    <label class="row"><input type="checkbox" data-quiet ${s.quietMode !== false ? 'checked' : ''}> Quiet mode (doubles cooldown after each fire until recovered)</label>
+    <div class="card" style="margin-top:12px" data-hist><div class="card-title">Alert history <button class="sm" data-hist-ref>Refresh</button></div><div data-hist-body class="muted small">Loading…</div></div>
+    <div class="card-title" style="margin-top:16px">Rules</div>
+    <div class="grid cols-2">
+      ${['cpu','mem','disk','temp'].map((k) => {
+        const r = (s.rules && s.rules[k]) || {};
+        return `<label class="row"><input type="checkbox" data-rule="${k}" ${r.enabled ? 'checked' : ''}> ${k.toUpperCase()} above <input type="number" data-above="${k}" value="${esc(String(r.above ?? 90))}" style="width:70px"> ${k === 'temp' ? '°C' : '%'} ${r.forMinutes != null ? `for <input type="number" data-for="${k}" value="${esc(String(r.forMinutes))}" style="width:60px"> min` : ''}</label>`;
+      }).join('')}
+      <label class="row"><input type="checkbox" data-rule="containerDown" ${(s.rules && s.rules.containerDown && s.rules.containerDown.enabled) ? 'checked' : ''}> Container down</label>
+    </div>
+    <div class="card-title" style="margin-top:16px">Channels</div>
+    <div class="grid cols-2">
+      <div class="card"><div class="card-title">Email <button class="sm" data-test="email">Test</button></div>
+        <label class="row"><input type="checkbox" data-c-email-en ${email.enabled ? 'checked' : ''}> Enabled</label>
+        <label>Host<input data-c-email-host value="${esc(email.host || '')}"></label>
+        <label>Port<input type="number" data-c-email-port value="${esc(String(email.port || 587))}"></label>
+        <label>To<input data-c-email-to value="${esc(email.to || '')}"></label>
+        <label>From<input data-c-email-from value="${esc(email.from || '')}"></label>
+        <label>User<input data-c-email-user value="${esc(email.user || '')}"></label>
+        <label>Password<input type="password" data-c-email-pass value="${email.pass ? '••••••' : ''}" placeholder="unchanged if blank"></label>
       </div>
-      <label class="row"><input type="checkbox" data-esec ${s.channels.email.secure ? 'checked' : ''}> Use TLS (port 465 style)</label>
-      <button class="sm" data-test-email style="margin-top:8px">Send test email</button></div>
-    <div class="card section"><div class="card-title">Telegram</div>
-      <label class="row"><input type="checkbox" data-ton ${s.channels.telegram.enabled ? 'checked' : ''}> Enable Telegram</label>
-      <label class="field"><span>Bot token</span><input data-ttoken value="${esc(s.channels.telegram.botToken)}"></label>
-      <label class="field"><span>Chat ID</span><input data-tchat value="${esc(s.channels.telegram.chatId)}"></label>
-      <button class="sm" data-test-tg>Send test message</button></div>
-    <button class="primary" data-save>Save alerts</button>`;
-  b.onclick = async (e) => {
-    if (e.target.closest('[data-test-email]')) { const r = await act(e.target, () => POST('/alerts/test', { channel: 'email' })); if (r) toast(JSON.stringify(r.results)); return; }
-    if (e.target.closest('[data-test-tg]')) { const r = await act(e.target, () => POST('/alerts/test', { channel: 'telegram' })); if (r) toast(JSON.stringify(r.results)); return; }
+      <div class="card"><div class="card-title">Telegram <button class="sm" data-test="telegram">Test</button></div>
+        <label class="row"><input type="checkbox" data-c-tg-en ${tg.enabled ? 'checked' : ''}> Enabled</label>
+        <label>Bot token<input data-c-tg-token value="${esc(tg.botToken || '')}"></label>
+        <label>Chat ID<input data-c-tg-chat value="${esc(tg.chatId || '')}"></label>
+      </div>
+      <div class="card"><div class="card-title">Webhook <button class="sm" data-test="webhook">Test</button></div>
+        <label class="row"><input type="checkbox" data-c-wh-en ${wh.enabled ? 'checked' : ''}> Enabled</label>
+        <label>URL<input data-c-wh-url value="${esc(wh.url || '')}" placeholder="https://…"></label>
+      </div>
+      <div class="card"><div class="card-title">Discord <button class="sm" data-test="discord">Test</button></div>
+        <label class="row"><input type="checkbox" data-c-dc-en ${dc.enabled ? 'checked' : ''}> Enabled</label>
+        <label>Webhook URL<input data-c-dc-url value="${esc(dc.webhookUrl || '')}"></label>
+      </div>
+      <div class="card"><div class="card-title">ntfy <button class="sm" data-test="ntfy">Test</button></div>
+        <label class="row"><input type="checkbox" data-c-nt-en ${nt.enabled ? 'checked' : ''}> Enabled</label>
+        <label>Server<input data-c-nt-server value="${esc(nt.server || 'https://ntfy.sh')}"></label>
+        <label>Topic<input data-c-nt-topic value="${esc(nt.topic || '')}"></label>
+        <label>Token<input data-c-nt-token value="${esc(nt.token || '')}" placeholder="optional"></label>
+      </div>
+    </div>
+    <button class="primary" data-save style="margin-top:14px">Save alerts</button></div>`;
+  
+  const loadHist = async () => {
+    const hb = $('[data-hist-body]', b); if (!hb) return;
+    try {
+      const h = await GET('/alerts/history?limit=40');
+      const ev = h.events || [];
+      hb.innerHTML = ev.length ? `<div class="table-wrap"><table><thead><tr><th>When</th><th>Key</th><th>Title</th><th>Result</th></tr></thead><tbody>
+        ${ev.map((e) => `<tr><td class="muted small">${esc(fmtDate(e.t))}</td><td class="mono small">${esc(e.key)}</td><td>${esc(e.title)}</td><td class="muted small">${esc((e.results || []).join(', '))}</td></tr>`).join('')}
+      </tbody></table></div>` : '<span class="muted">No alerts fired yet</span>';
+    } catch (e) { hb.textContent = e.message; }
+  };
+  loadHist();
+  const href = $('[data-hist-ref]', b); if (href) href.onclick = (ev) => { ev.preventDefault(); loadHist(); };
+
+b.onclick = async (e) => {
+    const test = e.target.closest('[data-test]');
+    if (test) {
+      const r = await act(test, () => POST('/alerts/test', { channel: test.dataset.test }));
+      if (r) toast(JSON.stringify(r.results || r));
+      return;
+    }
     if (!e.target.closest('[data-save]')) return;
+    const rules = {};
+    for (const k of ['cpu','mem','disk','temp','containerDown']) {
+      rules[k] = { enabled: !!$(`[data-rule="${k}"]`, b)?.checked };
+      const above = $(`[data-above="${k}"]`, b); if (above) rules[k].above = Number(above.value);
+      const fr = $(`[data-for="${k}"]`, b); if (fr) rules[k].forMinutes = Number(fr.value);
+    }
     const payload = {
-      enabled: $('[data-en]', b).checked, cooldownMinutes: +$('[data-cd]', b).value,
-      rules: {
-        cpu: { enabled: $('[data-r="cpu"]', b).checked, above: +$('[data-v="cpu"]', b).value, forMinutes: +$('[data-for="cpu"]', b).value },
-        mem: { enabled: $('[data-r="mem"]', b).checked, above: +$('[data-v="mem"]', b).value, forMinutes: +$('[data-for="mem"]', b).value },
-        disk: { enabled: $('[data-r="disk"]', b).checked, above: +$('[data-v="disk"]', b).value },
-        temp: { enabled: $('[data-r="temp"]', b).checked, above: +$('[data-v="temp"]', b).value },
-        containerDown: { enabled: $('[data-r="containerDown"]', b).checked, names: $('[data-ctrs]', b).value.split(',').map((x) => x.trim()).filter(Boolean) },
-      },
+      enabled: !!$('[data-en]', b).checked,
+      cooldownMinutes: Number($('[data-cd]', b).value) || 30,
+      quietMode: !!$('[data-quiet]', b)?.checked,
+      rules,
       channels: {
-        email: { enabled: $('[data-eon]', b).checked, host: $('[data-ehost]', b).value, port: +$('[data-eport]', b).value, user: $('[data-euser]', b).value, pass: $('[data-epass]', b).value, from: $('[data-efrom]', b).value, to: $('[data-eto]', b).value, secure: $('[data-esec]', b).checked },
-        telegram: { enabled: $('[data-ton]', b).checked, botToken: $('[data-ttoken]', b).value, chatId: $('[data-tchat]', b).value },
+        email: {
+          enabled: !!$('[data-c-email-en]', b).checked,
+          host: $('[data-c-email-host]', b).value, port: Number($('[data-c-email-port]', b).value) || 587,
+          to: $('[data-c-email-to]', b).value, from: $('[data-c-email-from]', b).value,
+          user: $('[data-c-email-user]', b).value, pass: $('[data-c-email-pass]', b).value,
+        },
+        telegram: {
+          enabled: !!$('[data-c-tg-en]', b).checked,
+          botToken: $('[data-c-tg-token]', b).value, chatId: $('[data-c-tg-chat]', b).value,
+        },
+        webhook: { enabled: !!$('[data-c-wh-en]', b).checked, url: $('[data-c-wh-url]', b).value },
+        discord: { enabled: !!$('[data-c-dc-en]', b).checked, webhookUrl: $('[data-c-dc-url]', b).value },
+        ntfy: {
+          enabled: !!$('[data-c-nt-en]', b).checked,
+          server: $('[data-c-nt-server]', b).value, topic: $('[data-c-nt-topic]', b).value, token: $('[data-c-nt-token]', b).value,
+        },
       },
     };
     await act(e.target, () => api('PUT', '/alerts', payload), 'Alerts saved');
-    reloadSection();
   };
 };
 
-async function renameLinuxDlg(name) {
-  const c = await GET(`/system/users/${encodeURIComponent(name)}/rename-check`);
-  if (c.blocked) { toast(c.blocked, true); return false; }
-  const busy = c.sessions || c.procs;
-  let done = null;
-  const send = async (m, force) => {
-    const v = { newName: $('[name=newName]', m).value.trim(), moveHome: $('[name=moveHome]', m).checked, renameGroup: $('[name=renameGroup]', m)?.checked || false, force };
-    try { done = await POST(`/system/users/${encodeURIComponent(name)}/rename`, v); return true; }
-    catch (e) {
-      if (e.status === 409 && /logged in/.test(e.message) && !force) {
-        const ok = await modal({ title: `${name} is in use`, body: `<p>${esc(e.message)}</p><p class="muted small">usermod usually refuses while the user has running processes.</p>`, buttons: [{ label: 'Cancel', value: false }, { label: 'Try anyway', cls: 'danger solid', value: true }] });
-        return ok ? send(m, true) : false;
+Settings.tokens = async (b) => {
+  const r = await GET('/tokens');
+  b.innerHTML = `<div class="card section"><div class="card-title">${ICON.key} API tokens</div>
+    <p class="muted">Bearer tokens for machine auth (skip CSRF). Secret shown only at creation. Header <span class="mono">Authorization: Bearer uk_…</span>. Scopes: <b>read</b> (GET only) or <b>operator</b> (writes).</p>
+    <div class="row wrap" style="margin-bottom:12px">
+      <input data-name placeholder="Name" style="max-width:160px">
+      <select data-scope style="width:auto"><option value="read">read</option><option value="operator" selected>operator</option></select>
+      <select data-role style="width:auto"><option value="viewer">viewer</option><option value="operator" selected>operator</option><option value="admin">admin</option></select>
+      <input type="number" data-exp placeholder="Expires days (blank=never)" style="max-width:140px" min="1">
+      <button class="primary" data-create>Create token</button>
+      <button class="danger" data-revoke-all>Revoke all</button>
+    </div>
+    <table><thead><tr><th>Name</th><th>Scope</th><th>Role</th><th>Prefix</th><th>Created</th><th>Expires</th><th>Last used</th><th></th></tr></thead><tbody>
+      ${(r.tokens || []).map((t) => `<tr class="${t.expired ? 'warn' : ''}">
+        <td>${esc(t.name)}</td><td>${esc(t.scope || '—')}</td><td>${esc(t.role)}</td><td class="mono">${esc(t.prefix || '')}…</td>
+        <td class="muted small">${t.created ? esc(fmtDate(t.created)) : '—'}</td>
+        <td class="muted small">${t.expiresAt ? esc(fmtDate(t.expiresAt)) : 'never'}${t.expired ? ' (expired)' : ''}</td>
+        <td class="muted small">${t.lastUsed ? esc(fmtDate(t.lastUsed)) : '—'}</td>
+        <td><button class="sm danger" data-rev="${esc(t.id)}">Revoke</button></td>
+      </tr>`).join('') || '<tr><td colspan="8" class="empty">No tokens</td></tr>'}
+    </tbody></table></div>`;
+  b.onclick = async (e) => {
+    if (e.target.closest('[data-create]')) {
+      const days = $('[data-exp]', b).value;
+      const created = await act(e.target, () => POST('/tokens', {
+        name: $('[data-name]', b).value,
+        role: $('[data-role]', b).value,
+        scope: $('[data-scope]', b).value,
+        expiresInDays: days ? Number(days) : undefined,
+      }));
+      if (created && created.token) {
+        modal({ title: 'Token created', body: `<p>Copy now — it will not be shown again.</p><p class="mono" style="word-break:break-all">${esc(created.token)}</p>` });
       }
-      throw e;
+      return Settings.tokens(b);
+    }
+    if (e.target.closest('[data-revoke-all]')) {
+      if (!(await confirmDlg('Revoke ALL API tokens?', 'Every machine token will stop working immediately.', { okLabel: 'Revoke all', danger: true }))) return;
+      await act(e.target, () => api('DELETE', '/tokens'), 'All revoked');
+      return Settings.tokens(b);
+    }
+    const rev = e.target.closest('[data-rev]');
+    if (rev) {
+      await act(rev, () => api('DELETE', '/tokens/' + encodeURIComponent(rev.dataset.rev)), 'Revoked');
+      return Settings.tokens(b);
     }
   };
-  const ok = await modal({
-    title: `Rename Linux user ${name}`,
-    body: `${busy ? `<div class="notice warn" style="margin-bottom:12px"><b>${esc(name)}</b> ${[c.sessions ? `is logged in (${c.sessions} session${c.sessions === 1 ? '' : 's'})` : '', c.procs ? `has ${c.procs} running process${c.procs === 1 ? '' : 'es'}` : ''].filter(Boolean).join(' and ')}. Renaming a user who is in use can fail or confuse running programs.</div>` : ''}
-      <label class="field"><span>New username</span><input name="newName" value="${esc(name)}" pattern="[a-z_][a-z0-9_\-]{0,31}" autocomplete="off"></label>
-      <p class="muted small" style="margin-top:-4px">Lowercase letters, digits, - and _. Runs <span class="mono">usermod -l</span>. The uid stays ${c.uid}, so file ownership is unchanged.</p>
-      <label class="row" style="margin:12px 0"><input type="checkbox" name="moveHome"> Also move the home directory <span class="mono muted small">${esc(c.home)} → ${esc(c.home.replace(/[^/]+$/, ''))}<span data-newhome>${esc(name)}</span></span></label>
-      ${c.primaryGroup ? `<label class="row" style="margin-bottom:12px"><input type="checkbox" name="renameGroup" checked> Also rename the primary group <span class="mono muted small">${esc(c.primaryGroup)}</span></label>` : ''}
-      <p class="muted small">Logged to the audit log. Cron jobs, sudoers entries or scripts that mention the old name are not changed.</p>`,
-    buttons: [{ label: 'Cancel', value: null }, { label: 'Rename user', cls: 'primary', handler: (m) => send(m, false), keepOpenOnError: true }],
-    onOpen: (m) => { const i = $('[name=newName]', m); i.oninput = () => { $('[data-newhome]', m).textContent = i.value.trim() || '…'; }; i.select(); },
-  });
-  if (ok && done) { toast(`Renamed to ${done.name}`); return true; }
-  return false;
-}
+};

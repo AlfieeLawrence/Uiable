@@ -12,7 +12,12 @@ const stats = require('./stats');
 const docker = require('./docker');
 const audit = require('./audit');
 const alerts = require('./alerts');
+const metrics = require('./metrics');
 const jobs = require('./jobs');
+const backup = require('./backup');
+const integrity = require('./integrity');
+const secrets = require('./secrets');
+const wireguard = require('./wireguard');
 
 const PORT = Number(process.env.UIABLE_PORT || process.env.PORT || 8080);
 const BIND = process.env.UIABLE_BIND || '127.0.0.1';
@@ -29,6 +34,10 @@ const STATS_MS = Math.max(1000, Number(process.env.UIABLE_STATS_INTERVAL_MS) || 
 
 audit.init(auth.DATA_DIR);
 alerts.init(auth.DATA_DIR);
+metrics.init(auth.DATA_DIR);
+secrets.init(auth.DATA_DIR);
+backup.init(auth.DATA_DIR);
+integrity.init(auth.DATA_DIR);
 
 const app = express();
 app.disable('x-powered-by');
@@ -43,6 +52,8 @@ app.use((req, res, next) => {
 });
 
 const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+
+api.get('/health', (req, res) => res.json({ ok: true, ts: Date.now() }));
 
 // ------------------------------------------------------------- public auth
 app.get('/api/state', (req, res) => {
@@ -142,6 +153,11 @@ api.post('/accounts/:name/password', express.json(), wrap(async (req, res) => {
     if (!(await auth.verify(req.session.username, req.body.current))) return res.status(400).json({ error: 'Current password is wrong' });
   }
   await auth.setPassword(req.params.name, req.body.password);
+  audit.write({
+    user: req.session.username, role: req.session.role, ip: req.socket.remoteAddress,
+    action: 'account.password', ok: true,
+    details: { target: req.params.name, self: req.params.name === req.session.username, secrets: 'omitted' },
+  });
   res.json({ ok: true });
 }));
 api.post('/accounts/:name/role', auth.role('admin'), express.json(), wrap(async (req, res) => {
@@ -203,6 +219,30 @@ api.delete('/accounts/:name', auth.role('admin'), wrap(async (req, res) => {
   res.json({ ok: true });
 }));
 
+
+// -------- API tokens (admin)
+api.get('/tokens', auth.role('admin'), (req, res) => res.json({ tokens: auth.listTokens() }));
+api.post('/tokens', auth.role('admin'), express.json(), wrap(async (req, res) => {
+  const created = auth.createApiToken({
+    name: req.body.name,
+    role: req.body.role || 'viewer',
+    scope: req.body.scope,
+    expiresInDays: req.body.expiresInDays,
+  });
+  audit.write({ user: req.session.username, action: 'token.create', details: { id: created.id, name: created.name, role: created.role, scope: created.scope, expiresAt: created.expiresAt, prefix: created.prefix } });
+  res.json(created);
+}));
+api.delete('/tokens', auth.role('admin'), wrap(async (req, res) => {
+  const r = auth.revokeAllApiTokens();
+  audit.write({ user: req.session.username, action: 'token.revoke_all', details: r });
+  res.json(Object.assign({ ok: true }, r));
+}));
+api.delete('/tokens/:id', auth.role('admin'), wrap(async (req, res) => {
+  auth.revokeApiToken(req.params.id);
+  audit.write({ user: req.session.username, action: 'token.revoke', details: { id: req.params.id } });
+  res.json({ ok: true });
+}));
+
 // 2FA (self-service)
 api.get('/account/2fa', wrap(async (req, res) => {
   const u = auth.findUser(req.session.username);
@@ -229,8 +269,8 @@ api.post('/account/2fa/backup', express.json(), wrap(async (req, res) => {
 // -------- docker: operator+ write, viewer read
 api.use('/docker', auth.rw('viewer', 'operator'));
 api.get('/docker/status', wrap(async (req, res) => {
-  if (!docker.available()) return res.json({ available: false, message: `Docker socket not found at ${docker.SOCK}. Mount it into the container to manage Docker.` });
-  try { const i = await docker.info(); res.json({ available: true, version: i.ServerVersion, containers: i.Containers, running: i.ContainersRunning, images: i.Images }); }
+  if (!docker.available()) return res.json({ available: false, message: `No Docker/Podman socket (tried docker.sock and podman.sock). Mount the engine socket into the container.` });
+  try { const i = await docker.info(); res.json({ available: true, engine: docker.engine(), socket: docker.SOCK, version: i.ServerVersion, containers: i.Containers, running: i.ContainersRunning, images: i.Images }); }
   catch (e) { res.json({ available: false, message: e.message }); }
 }));
 api.get('/docker/containers', wrap(async (req, res) => res.json({ containers: await docker.containers(), self: process.env.HOSTNAME || '' })));
@@ -270,6 +310,13 @@ api.use('/system', (req, res, next) => {
 // New feature routers
 api.use('/logs', auth.role('viewer'), require('./logs'));
 api.use('/updates', auth.role('admin'), require('./updates'));
+
+api.use('/metrics', auth.role('viewer'), metrics);
+api.use('/secrets', auth.role('admin'), secrets);
+api.use('/backup', auth.role('admin'), backup);
+api.use('/integrity', auth.role('admin'), integrity);
+api.use('/wireguard', auth.role('admin'), wireguard);
+
 api.use('/alerts', auth.role('admin'), alerts);
 api.use('/apps', auth.rw('viewer', 'operator'), require('./apps'));
 api.use('/stacks', auth.rw('viewer', 'operator'), require('./compose'));
@@ -285,6 +332,7 @@ api.use('/proxy', auth.role('admin'), require('./proxy'));
 api.use('/nettools', auth.rw('viewer', 'operator'), require('./nettools'));
 api.use('/scripts', auth.role('operator'), require('./scripts')); // writes are admin-only inside; operators run as their linked user
 api.use('/layout', auth.role('viewer'), require('./layout').router);
+api.post('/audit/scrub', auth.role('admin'), wrap(async (req, res) => res.json(await audit.scrubSecrets())));
 api.get('/audit', auth.role('admin'), wrap(async (req, res) => res.json(await audit.search(req.query))));
 
 app.use('/api', api);

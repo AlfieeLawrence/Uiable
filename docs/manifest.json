@@ -1,0 +1,101 @@
+{
+  "name": "Uiable",
+  "versionHint": "1.2.0",
+  "repository": "https://github.com/AlfieeLawrence/uiable",
+  "releases": "https://github.com/AlfieeLawrence/uiable/releases",
+  "companion": "https://github.com/AlfieeLawrence/Uiable-Connect",
+  "format": "markdown+yaml-frontmatter",
+  "pages": [
+    {
+      "title": "Documentation",
+      "description": "Guides for installing and operating the Uiable server dashboard.",
+      "order": 0,
+      "slug": "index",
+      "path": "docs/README.md"
+    },
+    {
+      "title": "Getting started",
+      "description": "What Uiable is, how it relates to Connect, and your first install.",
+      "order": 1,
+      "slug": "getting-started",
+      "path": "docs/getting-started.md"
+    },
+    {
+      "title": "Install",
+      "description": "Installer, Compose, bare metal, ports, and Umbrel notes.",
+      "order": 10,
+      "slug": "install",
+      "path": "docs/install.md"
+    },
+    {
+      "title": "Updates and releases",
+      "description": "GitHub Releases, self-updater, checksums, and rollback.",
+      "order": 11,
+      "slug": "updates",
+      "path": "docs/updates.md"
+    },
+    {
+      "title": "Security and secrets",
+      "description": "Password redaction, encrypted secrets.env.enc, API tokens, roles.",
+      "order": 20,
+      "slug": "security",
+      "path": "docs/security.md"
+    },
+    {
+      "title": "Metrics history",
+      "description": "SQLite metrics retention (default 7 days) and dashboard controls.",
+      "order": 30,
+      "slug": "metrics",
+      "path": "docs/metrics.md"
+    },
+    {
+      "title": "Alerts",
+      "description": "Email, Telegram, webhook, Discord, ntfy; quiet mode and history.",
+      "order": 31,
+      "slug": "alerts",
+      "path": "docs/alerts.md"
+    },
+    {
+      "title": "Backups",
+      "description": "Restic/rsync profiles with secrets stored outside backups.json.",
+      "order": 32,
+      "slug": "backups",
+      "path": "docs/backups.md"
+    },
+    {
+      "title": "Storage RAID and ZFS",
+      "description": "Inventory plus safe start/stop/scrub actions.",
+      "order": 33,
+      "slug": "storage",
+      "path": "docs/storage.md"
+    },
+    {
+      "title": "WireGuard",
+      "description": "Native peers, config/QR download, bring-up.",
+      "order": 34,
+      "slug": "wireguard",
+      "path": "docs/wireguard.md"
+    },
+    {
+      "title": "File integrity",
+      "description": "Scheduled path watches and alerts on hash mismatch.",
+      "order": 35,
+      "slug": "integrity",
+      "path": "docs/integrity.md"
+    },
+    {
+      "title": "Uiable Connect",
+      "description": "Desktop/mobile companion for SSH, SFTP, tunnels, and remote install.",
+      "order": 80,
+      "slug": "connect",
+      "path": "docs/connect.md"
+    },
+    {
+      "title": "Troubleshooting",
+      "description": "Common install, Docker, secrets unlock, and tunnel fixes.",
+      "order": 90,
+      "slug": "troubleshooting",
+      "path": "docs/troubleshooting.md"
+    }
+  ]
+}

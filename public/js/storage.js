@@ -1,6 +1,59 @@
 'use strict';
 Pages.storage = (el, params) => {
-  el.innerHTML = `<div class="tabs"><button data-tab="disks" class="active">Disks</button><button data-tab="usage">Folder usage</button></div><div data-body></div>`;
+  // RAID / ZFS panel is loaded alongside disks
+
+  el.innerHTML = `<div class="tabs"><button data-tab="disks" class="active">Disks</button><button data-tab="usage">Folder usage</button></div><div data-body></div>
+  <div data-raid style="margin-top:14px"></div>`;
+
+  const raidBox = () => $('[data-raid]', el);
+  const loadRaid = async () => {
+    const box = raidBox(); if (!box) return;
+    try {
+      const r = await GET('/storage/raid');
+      const md = r.mdadm || {}, z = r.zfs || {};
+      box.innerHTML = `<div class="grid cols-2">
+        <div class="card"><div class="card-title">MD RAID ${md.available ? '' : '<span class="chip">n/a</span>'}</div>
+          ${!md.available ? '<p class="muted">mdadm not installed</p>' : `<pre class="mono small">${esc(md.mdstat || md.scan || 'No arrays')}</pre>
+            <ul>${(md.arrays||[]).map((a) => `<li class="mono">${esc(a.name)} · ${esc(a.level)} · ${esc(a.status)} · ${esc(a.devices)}
+              <button class="sm" data-md-start="${esc(a.name)}">Start</button>
+              <button class="sm danger" data-md-stop="${esc(a.name)}">Stop</button></li>`).join('') || ''}</ul>`}
+        </div>
+        <div class="card"><div class="card-title">ZFS ${z.available ? '' : '<span class="chip">n/a</span>'}</div>
+          ${!z.available ? '<p class="muted">zfs/zpool not installed</p>' : `
+            <div class="table-wrap"><table><thead><tr><th>Pool</th><th>Size</th><th>Alloc</th><th>Health</th><th></th></tr></thead><tbody>
+              ${(z.pools||[]).map((p) => `<tr><td class="mono">${esc(p.name)}</td><td>${esc(p.size)}</td><td>${esc(p.alloc)}</td><td>${esc(p.health)}</td>
+                <td><button class="sm" data-zscrub="${esc(p.name)}">Scrub</button></td></tr>`).join('') || '<tr><td colspan="5" class="empty">No pools</td></tr>'}
+            </tbody></table></div>`}
+        </div>
+      </div>`;
+      const box = raidBox();
+      if (box && !box._raidBound) {
+        box._raidBound = true;
+        box.addEventListener('click', async (ev) => {
+          const stBtn = ev.target.closest('[data-md-start]');
+          if (stBtn) {
+            if (!(await confirmDlg('Start array ' + stBtn.dataset.mdStart + '?', 'Runs mdadm --run. Safe assemble only.', { okLabel: 'Start' }))) return;
+            await act(stBtn, () => POST('/storage/raid/mdadm/' + encodeURIComponent(stBtn.dataset.mdStart) + '/start'), 'Started');
+            return loadRaid();
+          }
+          const sp = ev.target.closest('[data-md-stop]');
+          if (sp) {
+            if (!(await confirmDlg('STOP array ' + sp.dataset.mdStop + '?', 'Confirm exact name. Does not destroy the array.', { okLabel: 'Stop ' + sp.dataset.mdStop, danger: true }))) return;
+            await act(sp, () => POST('/storage/raid/mdadm/' + encodeURIComponent(sp.dataset.mdStop) + '/stop', { confirm: sp.dataset.mdStop }), 'Stopped');
+            return loadRaid();
+          }
+          const zb = ev.target.closest('[data-zscrub]');
+          if (zb) {
+            if (!(await confirmDlg('Scrub ZFS pool ' + zb.dataset.zscrub + '?', 'Starts zpool scrub (no destroy).', { okLabel: 'Scrub' }))) return;
+            await act(zb, () => POST('/storage/raid/zfs/' + encodeURIComponent(zb.dataset.zscrub) + '/scrub'), 'Scrub started');
+            return loadRaid();
+          }
+        });
+      }
+    } catch (e) { if (raidBox()) raidBox().innerHTML = `<div class="notice">${esc(e.message)}</div>`; }
+  };
+  loadRaid();
+
   let tab = 'disks';
   const body = $('[data-body]', el);
   const showDisks = async () => {

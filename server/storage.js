@@ -141,4 +141,86 @@ router.post('/format', wrap(async (req, res) => {
   res.json({ ok: true, job: jobs.view(job) });
 }));
 
+
+router.get('/raid', wrap(async (req, res) => {
+  const out = { mdadm: { available: false, arrays: [] }, zfs: { available: false, pools: [], datasets: [] } };
+  if (await host.has('mdadm')) {
+    out.mdadm.available = true;
+    const d = await host.run('mdadm', ['--detail', '--scan'], { timeout: 15000 });
+    const detail = await host.run('cat', ['/proc/mdstat'], { timeout: 5000 });
+    out.mdadm.scan = (d.stdout || '').trim();
+    out.mdadm.mdstat = (detail.stdout || '').trim();
+    const arrays = [];
+    for (const line of (detail.stdout || '').split('\n')) {
+      const m = line.match(/^(md\d+)\s*:\s*(\w+)\s+(\w+)\s*(.*)$/);
+      if (m) arrays.push({ name: m[1], status: m[2], level: m[3], devices: m[4].trim() });
+    }
+    out.mdadm.arrays = arrays;
+  }
+  if (await host.has('zpool')) {
+    out.zfs.available = true;
+    const pools = await host.run('zpool', ['list', '-H', '-o', 'name,size,alloc,free,health,frag'], { timeout: 15000 });
+    out.zfs.pools = (pools.stdout || '').trim().split('\n').filter(Boolean).map((l) => {
+      const p = l.split('\t');
+      return { name: p[0], size: p[1], alloc: p[2], free: p[3], health: p[4], frag: p[5] };
+    });
+    if (await host.has('zfs')) {
+      const ds = await host.run('zfs', ['list', '-H', '-o', 'name,used,avail,refer,mountpoint'], { timeout: 15000 });
+      out.zfs.datasets = (ds.stdout || '').trim().split('\n').filter(Boolean).map((l) => {
+        const p = l.split('\t');
+        return { name: p[0], used: p[1], avail: p[2], refer: p[3], mountpoint: p[4] };
+      });
+    }
+  }
+  res.json(out);
+}));
+
+
+
+// Safe RAID/ZFS actions only — no create/destroy.
+router.post('/raid/mdadm/:name/start', wrap(async (req, res) => {
+  const name = String(req.params.name || '');
+  if (!/^md\d+$/.test(name)) throw bad('Bad array name');
+  if (!(await host.has('mdadm'))) throw bad('mdadm not available', 501);
+  const dev = '/dev/' + name;
+  const r = await host.run('mdadm', ['--run', dev], { timeout: 60000 });
+  if (r.code !== 0) throw bad((r.stderr || r.stdout || 'mdadm --run failed').trim(), 500);
+  audit.write({ user: req.session.username, action: 'storage.raid.start', details: { name } });
+  res.json({ ok: true, stdout: (r.stdout || '').trim() });
+}));
+
+router.post('/raid/mdadm/:name/stop', wrap(async (req, res) => {
+  const name = String(req.params.name || '');
+  if (!/^md\d+$/.test(name)) throw bad('Bad array name');
+  if (!(await host.has('mdadm'))) throw bad('mdadm not available', 501);
+  const confirm = String((req.body && req.body.confirm) || '');
+  if (confirm !== name) throw bad('Confirm by sending { "confirm": "' + name + '" }', 400);
+  const dev = '/dev/' + name;
+  const r = await host.run('mdadm', ['--stop', dev], { timeout: 60000 });
+  if (r.code !== 0) throw bad((r.stderr || r.stdout || 'mdadm --stop failed').trim(), 500);
+  audit.write({ user: req.session.username, action: 'storage.raid.stop', details: { name } });
+  res.json({ ok: true, stdout: (r.stdout || '').trim() });
+}));
+
+router.post('/raid/zfs/:pool/scrub', wrap(async (req, res) => {
+  const pool = String(req.params.pool || '');
+  if (!/^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(pool)) throw bad('Bad pool name');
+  if (!(await host.has('zpool'))) throw bad('zpool not available', 501);
+  const r = await host.run('zpool', ['scrub', pool], { timeout: 60000 });
+  if (r.code !== 0) throw bad((r.stderr || r.stdout || 'zpool scrub failed').trim(), 500);
+  audit.write({ user: req.session.username, action: 'storage.zfs.scrub', details: { pool } });
+  res.json({ ok: true, stdout: (r.stdout || '').trim() });
+}));
+
+router.post('/raid/zfs/:pool/scrub-stop', wrap(async (req, res) => {
+  const pool = String(req.params.pool || '');
+  if (!/^[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(pool)) throw bad('Bad pool name');
+  if (!(await host.has('zpool'))) throw bad('zpool not available', 501);
+  const r = await host.run('zpool', ['scrub', '-s', pool], { timeout: 60000 });
+  if (r.code !== 0) throw bad((r.stderr || r.stdout || 'zpool scrub -s failed').trim(), 500);
+  audit.write({ user: req.session.username, action: 'storage.zfs.scrub_stop', details: { pool } });
+  res.json({ ok: true });
+}));
+
 module.exports = router;
+

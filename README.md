@@ -4,9 +4,11 @@ A lightweight, self-hosted dashboard for any Linux server, shipped as one Docker
 Umbrel-style look (app grid, rounded cards, dock, dark/light modes) with Termius-style tools
 (SFTP file manager, tabbed web terminal) plus an app store, alerts, roles, 2FA and more.
 
-> **Companion desktop app:** [Uiable Connect](https://github.com/AlfieeLawrence/uiable-connect) for Windows and macOS saves your servers and logins, opens the SSH tunnel to this dashboard in one click, and gives you a terminal, file manager and port forwards even on servers without Uiable.
+> **Companion desktop app:** [Uiable Connect](https://github.com/AlfieeLawrence/Uiable-Connect) for Windows and macOS saves your servers and logins, opens the SSH tunnel to this dashboard in one click, and gives you a terminal, file manager and port forwards even on servers without Uiable.
 
 **Download:** grab `uiable.zip` from the [latest release](https://github.com/AlfieeLawrence/uiable/releases/latest).
+
+**Docs (website-ready):** see [`docs/`](docs/) — start at [`docs/README.md`](docs/README.md); machine index [`docs/manifest.json`](docs/manifest.json).
 
 ## Features
 
@@ -168,5 +170,6 @@ install.sh      Docker-aware installer (Umbrel-friendly)
 
 ## Changelog
 
+- **1.2.0** - Metrics history (SQLite, 7-day default retention), themes, MIT LICENSE, audit secret redaction, encrypted secrets (OpenSSL AES-256-CBC PBKDF2), self-updater with checksum/health/rollback, backups/WireGuard/integrity, alerts (webhook/Discord/ntfy + history), API token scopes/expiry, RAID/ZFS safe actions, fail2ban, Podman socket, GPU/cpuTemp stats, GitHub Release CI, structured docs.
 - **1.1.3** - Removed the non-working "Done" button from the script run/output dialog (Close stays). Long script names in the Scripts list and editor header now truncate with "…" and scroll on hover (the list row was overflowing its card).
 - **1.1.2** - Scripts and terminals run outside the dashboard 256M memory limit (systemd-run scope, else cgroup move), so big builds like `pnpm build` are no longer "Killed". Scripts now run like an SSH session: your login shell with ~/.profile, ~/.bash_profile and ~/.bashrc loaded (nvm, pnpm, ~/.local/bin, aliases).

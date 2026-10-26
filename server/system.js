@@ -327,7 +327,9 @@ router.post('/users', wrap(async (req, res) => {
 }));
 
 router.post('/users/:name/password', wrap(async (req, res) => {
-  await setPassword(userName(req.params.name), req.body.password);
+  const name = userName(req.params.name);
+  await setPassword(name, req.body.password);
+  audit.write({ user: req.session.username, role: req.session.role, ip: req.socket.remoteAddress, action: 'linux.user.password', ok: true, details: { target: name, secrets: 'omitted' } });
   res.json({ ok: true });
 }));
 

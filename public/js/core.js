@@ -192,6 +192,10 @@ const APPS = [
   { id: 'updates', name: 'Updates', icon: 'refresh', bg: 'linear-gradient(135deg,#a855f7,#7c3aed)', role: 'admin' },
   { id: 'firewall', name: 'Firewall', icon: 'shield', bg: 'linear-gradient(135deg,#ef4444,#b91c1c)', role: 'admin' },
   { id: 'cron', name: 'Scheduled', icon: 'clock', bg: 'linear-gradient(135deg,#f59e0b,#d97706)', role: 'admin' },
+  { id: 'backup', name: 'Backups', icon: 'download', bg: 'linear-gradient(135deg,#0ea5e9,#0369a1)', role: 'admin' },
+  { id: 'wireguard', name: 'WireGuard', icon: 'globe', bg: 'linear-gradient(135deg,#88171a,#b91c1c)', role: 'admin' },
+  { id: 'integrity', name: 'Integrity', icon: 'shield', bg: 'linear-gradient(135deg,#57534e,#292524)', role: 'admin' },
+  { id: 'metrics', name: 'Metrics history', icon: 'chart', bg: 'linear-gradient(135deg,#7c5cff,#22c1c3)', role: 'viewer' },
   { id: 'proxy', name: 'Proxy', icon: 'globe', bg: 'linear-gradient(135deg,#22c55e,#16a34a)', role: 'admin' },
   { id: 'audit', name: 'Audit log', icon: 'logs', bg: 'linear-gradient(135deg,#78716c,#57534e)', role: 'admin' },
   { id: 'settings', name: 'Settings', icon: 'settings', bg: 'linear-gradient(135deg,#64748b,#94a3b8)', role: 'viewer' },
@@ -200,18 +204,25 @@ const visibleApps = () => APPS.filter((a) => can(a.role));
 const ctrColor = (s) => { let h = 0; for (const c of s) h = (h * 31 + c.charCodeAt(0)) % 360; return `linear-gradient(135deg,hsl(${h},70%,55%),hsl(${(h + 40) % 360},70%,45%))`; };
 const appIcon = (a, cls = '') => `<div class="app-icon ${cls}" style="background:${a.bg}">${ICON[a.icon]}</div>`;
 
-// ------------------------------------------------------------------ theme
-function setTheme(t) {
-  localStorage.setItem('uiable-theme', t);
-  const dark = t === 'dark' || (t === 'system' && matchMedia('(prefers-color-scheme: dark)').matches);
-  document.documentElement.dataset.theme = dark ? 'dark' : 'light';
+// ------------------------------------------------------------------ theme (whole-app; matches Uiable Connect palettes)
+const APP_THEMES = ['dark', 'light', 'solarized', 'dracula', 'monokai'];
+const THEME_KEY = 'uiable-theme';
+function resolveTheme(pref) {
+  const p = pref || localStorage.getItem(THEME_KEY) || 'system';
+  if (p === 'system') return matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+  return APP_THEMES.includes(p) ? p : 'dark';
 }
-const getTheme = () => localStorage.getItem('uiable-theme') || 'system';
+function setTheme(t) {
+  if (t != null) localStorage.setItem(THEME_KEY, t);
+  document.documentElement.dataset.theme = resolveTheme();
+  try { window.dispatchEvent(new CustomEvent('uiable-theme')); } catch (_) {}
+}
+const getTheme = () => localStorage.getItem(THEME_KEY) || 'system';
 matchMedia('(prefers-color-scheme: dark)').addEventListener('change', () => { if (getTheme() === 'system') setTheme('system'); });
 
 // ------------------------------------------------------------------ live stats hub (websocket with polling fallback)
 const Stats = {
-  subs: new Set(), ws: null, poll: null, last: null, history: { cpu: [], mem: [], rx: [], tx: [] },
+  subs: new Set(), ws: null, poll: null, last: null, history: { cpu: [], mem: [], rx: [], tx: [], gpu: [] },
   subscribe(fn) {
     this.subs.add(fn);
     if (this.last) fn(this.last);
@@ -223,6 +234,7 @@ const Stats = {
     const h = this.history; const cap = 90;
     h.cpu.push(d.cpu.usage); h.mem.push(d.memory.total ? (d.memory.used / d.memory.total) * 100 : 0);
     h.rx.push(d.network.rxRate); h.tx.push(d.network.txRate);
+    if (d.gpu && d.gpu.util != null) h.gpu.push(d.gpu.util);
     Object.values(h).forEach((a) => { while (a.length > cap) a.shift(); });
     this.subs.forEach((fn) => { try { fn(d); } catch (e) { console.error(e); } });
   },
@@ -284,6 +296,7 @@ const PAGE_ASSETS = {
   apps: ['/js/apps.js'], scripts: ['/js/scripts.js'], stacks: ['/js/stacks.js'], logs: ['/js/logs.js'], storage: ['/js/storage.js'],
   updates: ['/js/updates.js'], firewall: ['/js/firewall.js'], cron: ['/js/cron.js'], proxy: ['/js/proxy.js'],
   'network-tools': ['/js/nettools.js'], audit: ['/js/audit.js'],
+  backup: ['/js/backup.js'], wireguard: ['/js/wireguard.js'], integrity: ['/js/integrity.js'], metrics: ['/js/metrics-page.js'],
   home: ['/js/home.js'], launcher: ['/js/launcher.js'],
 };
 const loadedAssets = {};
@@ -335,7 +348,7 @@ async function route() {
 function dockItemIcon(d) {
   if (d.type === 'home') return { bg: 'linear-gradient(135deg,#7c5cff,#22c1c3)', html: ICON.home, tip: 'Home', href: '#/' };
   if (d.type === 'launcher') return { bg: 'linear-gradient(135deg,#f59e0b,#ef4444)', html: ICON.grid, tip: 'All apps', href: '#/launcher' };
-  if (d.type === 'theme') return { bg: 'var(--input)', html: document.documentElement.dataset.theme === 'dark' ? ICON.sun : ICON.moon, tip: 'Toggle theme', href: '#', theme: true, color: 'var(--text)' };
+  if (d.type === 'theme') return { bg: 'var(--input)', html: document.documentElement.dataset.theme === 'light' ? ICON.moon : ICON.sun, tip: 'Theme · ' + getTheme(), href: '#', theme: true, color: 'var(--text)' };
   if (d.type === 'app') {
     const a = APPS.find((x) => x.id === d.app);
     if (!a || !can(a.role)) return null;
@@ -368,7 +381,18 @@ function dockHtml(active) {
 }
 function bindDock() {
   const t = $('[data-theme-toggle]');
-  if (t) t.onclick = (e) => { e.preventDefault(); setTheme(document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark'); const ic = t.querySelector('.app-icon'); if (ic) ic.innerHTML = document.documentElement.dataset.theme === 'dark' ? ICON.sun : ICON.moon; };
+  if (t) t.onclick = (e) => {
+    e.preventDefault();
+    const cycle = ['system', ...APP_THEMES];
+    const cur = getTheme();
+    const i = cycle.indexOf(cur);
+    setTheme(cycle[(i < 0 ? 0 : i + 1) % cycle.length]);
+    const resolved = document.documentElement.dataset.theme;
+    const ic = t.querySelector('.app-icon');
+    if (ic) ic.innerHTML = resolved === 'light' ? ICON.moon : ICON.sun;
+    const tip = t.querySelector('.tip');
+    if (tip) tip.textContent = 'Theme · ' + getTheme();
+  };
   $$('[data-ext]', document.querySelector('.dock') || document).forEach((a) => {
     a.onclick = (e) => { e.preventDefault(); window.open(a.dataset.ext, '_blank', 'noopener'); };
   });

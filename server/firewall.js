@@ -150,4 +150,56 @@ router.post('/rule', wrap(async (req, res) => {
   res.json({ ok: true, output: r.stdout });
 }));
 
+
+// ---- fail2ban ----
+async function fail2banAvailable() {
+  return host.has('fail2ban-client');
+}
+
+router.get('/fail2ban', wrap(async (req, res) => {
+  if (!(await fail2banAvailable())) {
+    return res.json({ available: false, message: 'fail2ban-client not found on this host.', jails: [] });
+  }
+  const st = await host.run('fail2ban-client', ['status'], { timeout: 10000 });
+  if (st.code !== 0) throw fail(st, 'fail2ban-client status');
+  const jails = [];
+  const m = st.stdout.match(/Jail list:\s*(.*)/i);
+  const names = m ? m[1].split(',').map((s) => s.trim()).filter(Boolean) : [];
+  for (const name of names) {
+    const j = await host.run('fail2ban-client', ['status', name], { timeout: 10000 });
+    const banned = [];
+    const bm = j.stdout.match(/Banned IP list:\s*(.*)/i);
+    if (bm) banned.push(...bm[1].split(/\s+/).map((s) => s.trim()).filter(Boolean));
+    const fc = (j.stdout.match(/Currently failed:\s*(\d+)/i) || [])[1];
+    const bc = (j.stdout.match(/Currently banned:\s*(\d+)/i) || [])[1];
+    jails.push({ name, failed: Number(fc) || 0, bannedCount: Number(bc) || banned.length, banned });
+  }
+  res.json({ available: true, jails, raw: st.stdout.trim() });
+}));
+
+router.post('/fail2ban/unban', wrap(async (req, res) => {
+  if (!(await fail2banAvailable())) throw bad('fail2ban not available', 501);
+  const jail = String(req.body.jail || '').trim();
+  const ip = String(req.body.ip || '').trim();
+  if (!/^[\w.-]+$/.test(jail)) throw bad('Bad jail');
+  if (!/^\d{1,3}(\.\d{1,3}){3}$|^[0-9a-f:]+$/i.test(ip)) throw bad('Bad IP');
+  const r = await host.run('fail2ban-client', ['set', jail, 'unbanip', ip], { timeout: 10000 });
+  if (r.code !== 0) throw fail(r, 'unban');
+  audit.write({ user: req.session.username, action: 'fail2ban.unban', details: { jail, ip } });
+  res.json({ ok: true, output: r.stdout.trim() });
+}));
+
+router.post('/fail2ban/ban', wrap(async (req, res) => {
+  if (!(await fail2banAvailable())) throw bad('fail2ban not available', 501);
+  const jail = String(req.body.jail || '').trim();
+  const ip = String(req.body.ip || '').trim();
+  if (!/^[\w.-]+$/.test(jail)) throw bad('Bad jail');
+  if (!/^\d{1,3}(\.\d{1,3}){3}$|^[0-9a-f:]+$/i.test(ip)) throw bad('Bad IP');
+  const r = await host.run('fail2ban-client', ['set', jail, 'banip', ip], { timeout: 10000 });
+  if (r.code !== 0) throw fail(r, 'ban');
+  audit.write({ user: req.session.username, action: 'fail2ban.ban', details: { jail, ip } });
+  res.json({ ok: true, output: r.stdout.trim() });
+}));
+
+
 module.exports = router;

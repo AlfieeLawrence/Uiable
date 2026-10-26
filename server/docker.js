@@ -3,13 +3,35 @@
 const http = require('http');
 const fs = require('fs');
 
-const SOCK = process.env.DOCKER_SOCK || '/var/run/docker.sock';
+const DOCKER_SOCK = process.env.DOCKER_SOCK || '/var/run/docker.sock';
+const PODMAN_SOCK = process.env.PODMAN_SOCK || '/var/run/podman/podman.sock';
+let ENGINE = null; // 'docker' | 'podman' | null
+let SOCK = DOCKER_SOCK;
 
-function available() { try { return fs.statSync(SOCK).isSocket(); } catch (_) { return false; } }
+function detectEngine() {
+  if (ENGINE) return ENGINE;
+  const prefer = (process.env.UIABLE_CONTAINER_ENGINE || '').toLowerCase();
+  const candidates = prefer === 'podman'
+    ? [[PODMAN_SOCK, 'podman'], [DOCKER_SOCK, 'docker']]
+    : prefer === 'docker'
+      ? [[DOCKER_SOCK, 'docker'], [PODMAN_SOCK, 'podman']]
+      : [[DOCKER_SOCK, 'docker'], [PODMAN_SOCK, 'podman']];
+  for (const [sock, name] of candidates) {
+    try {
+      if (fs.statSync(sock).isSocket()) { SOCK = sock; ENGINE = name; return ENGINE; }
+    } catch (_) {}
+  }
+  ENGINE = null;
+  return null;
+}
+
+function available() { return !!detectEngine(); }
+function engine() { return detectEngine(); }
+function socketPath() { detectEngine(); return SOCK; }
 
 function request(method, path, { body, raw } = {}) {
   return new Promise((resolve, reject) => {
-    if (!available()) return reject(Object.assign(new Error(`Docker socket not found at ${SOCK}`), { status: 503 }));
+    if (!available()) return reject(Object.assign(new Error(`No Docker/Podman socket (tried ${DOCKER_SOCK} and ${PODMAN_SOCK})`), { status: 503 }));
     const data = body ? JSON.stringify(body) : null;
     const req = http.request({
       socketPath: SOCK, path, method,
@@ -73,7 +95,8 @@ function calcStats(s) {
 }
 
 module.exports = {
-  SOCK, available,
+  get SOCK() { return socketPath(); },
+  available, engine, socketPath,
   info: () => request('GET', '/info'),
   containers: () => request('GET', '/containers/json?all=1'),
   action: (cid, act) => {

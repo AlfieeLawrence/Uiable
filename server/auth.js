@@ -28,7 +28,8 @@ function save(file, obj) {
 }
 const err = (msg, status = 400) => Object.assign(new Error(msg), { status });
 
-let config = load(CONFIG, { users: [] });
+let config = load(CONFIG, { users: [], tokens: [] });
+if (!Array.isArray(config.tokens)) config.tokens = [];
 // migrate accounts created before roles existed: they were all admins
 let migrated = false;
 config.users.forEach((u) => { if (!ROLES.hasOwnProperty(u.role)) { u.role = 'admin'; migrated = true; } });
@@ -322,18 +323,106 @@ function recordFailure(ip) {
 function clearFailures(ip) { attempts.delete(ip); }
 
 /** Express middleware: requires a session; enforces CSRF on unsafe methods. */
+
+// -------- API tokens (Bearer). Stored hashed; plaintext shown once at creation.
+function listTokens() {
+  const now = Date.now();
+  return (config.tokens || []).map((x) => {
+    const expired = !!(x.expiresAt && Date.parse(x.expiresAt) < now);
+    return {
+      id: x.id, name: x.name, role: x.role,
+      scope: x.scope || (x.role === 'viewer' ? 'read' : 'operator'),
+      created: x.created, lastUsed: x.lastUsed || null,
+      expiresAt: x.expiresAt || null, expired,
+      prefix: x.prefix || '',
+    };
+  });
+}
+function createApiToken({ name, role = 'viewer', scope, expiresInDays } = {}) {
+  // scope: 'read' (GET-ish) or 'operator' (writes). role still used for requireAuth role checks.
+  let sc = scope === 'read' || scope === 'operator' ? scope : null;
+  if (!sc) sc = (role === 'viewer') ? 'read' : 'operator';
+  // Map scope → minimum role if role not explicitly higher
+  let useRole = role;
+  if (!ROLES.hasOwnProperty(useRole)) throw err('Unknown role');
+  if (sc === 'read' && (ROLES[useRole] ?? -1) > ROLES.viewer) {
+    // keep elevated role if admin explicitly chose it, but scope still gates writes below
+  }
+  if (sc === 'operator' && (ROLES[useRole] ?? -1) < ROLES.operator) useRole = 'operator';
+  const label = String(name || '').trim().slice(0, 64) || 'token';
+  const raw = 'uk_' + crypto.randomBytes(24).toString('base64url');
+  const id = 'tok_' + crypto.randomBytes(6).toString('hex');
+  let expiresAt = null;
+  const days = Number(expiresInDays);
+  if (Number.isFinite(days) && days > 0) {
+    expiresAt = new Date(Date.now() + Math.min(3650, days) * 86400 * 1000).toISOString();
+  }
+  const rec = {
+    id, name: label, role: useRole, scope: sc,
+    hash: hashToken(raw),
+    prefix: raw.slice(0, 8),
+    created: new Date().toISOString(),
+    lastUsed: null,
+    expiresAt,
+  };
+  if (!Array.isArray(config.tokens)) config.tokens = [];
+  config.tokens.push(rec);
+  save(CONFIG, config);
+  return { token: raw, ...listTokens().find((x) => x.id === id) };
+}
+function revokeApiToken(id) {
+  const before = config.tokens.length;
+  config.tokens = (config.tokens || []).filter((x) => x.id !== id);
+  if (config.tokens.length === before) throw err('No such token', 404);
+  save(CONFIG, config);
+}
+function revokeAllApiTokens() {
+  const n = (config.tokens || []).length;
+  config.tokens = [];
+  save(CONFIG, config);
+  return { revoked: n };
+}
+function verifyApiToken(raw) {
+  if (!raw || typeof raw !== 'string') return null;
+  const h = hashToken(raw);
+  const rec = (config.tokens || []).find((x) => x.hash === h);
+  if (!rec) return null;
+  if (rec.expiresAt && Date.parse(rec.expiresAt) < Date.now()) return null;
+  rec.lastUsed = new Date().toISOString();
+  // debounce disk writes — at most once per 60s per token would be nicer; keep simple
+  save(CONFIG, config);
+  const scope = rec.scope || (rec.role === 'viewer' ? 'read' : 'operator');
+  return { id: rec.id, name: rec.name, role: rec.role, scope, username: 'token:' + rec.name };
+}
+
 function requireAuth(req, res, next) {
   const s = getSession(req);
-  if (!s) return res.status(401).json({ error: 'Not signed in' });
-  if (!['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
-    const tok = Buffer.from(String(req.headers['x-csrf-token'] || ''));
-    const want = Buffer.from(s.csrf);
-    if (tok.length !== want.length || !crypto.timingSafeEqual(tok, want) || !sameOrigin(req)) {
-      return res.status(403).json({ error: 'CSRF check failed. Reload the page.' });
+  if (s) {
+    if (!['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
+      const tok = Buffer.from(String(req.headers['x-csrf-token'] || ''));
+      const want = Buffer.from(s.csrf);
+      if (tok.length !== want.length || !crypto.timingSafeEqual(tok, want) || !sameOrigin(req)) {
+        return res.status(403).json({ error: 'CSRF check failed. Reload the page.' });
+      }
+    }
+    req.session = s;
+    return next();
+  }
+  // Machine auth: Authorization: Bearer uk_...
+  const authz = String(req.headers.authorization || '');
+  const m = authz.match(/^Bearer\s+(.+)$/i);
+  if (m) {
+    const rec = verifyApiToken(m[1].trim());
+    if (rec) {
+      if (rec.scope === 'read' && !['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
+        return res.status(403).json({ error: 'This API token is read-scoped (GET only)' });
+      }
+      req.session = { username: rec.username, role: rec.role, via: 'token', tokenId: rec.id, scope: rec.scope };
+      req.apiToken = rec;
+      return next();
     }
   }
-  req.session = s;
-  next();
+  return res.status(401).json({ error: 'Not signed in' });
 }
 
 const atLeast = (role, min) => (ROLES[role] ?? -1) >= ROLES[min];
@@ -345,6 +434,7 @@ const rw = (readMin, writeMin) => (req, res, next) => role(['GET', 'HEAD'].inclu
 module.exports = {
   DATA_DIR, ROLES, ROLE_NAMES, needsSetup, createUser, verify, setPassword, setRole, deleteUser, listUsers, findUser, renameUser, setDisplayName, linuxSettings, setLinuxSettings, setLinuxUser,
   createSession, getSession, destroySession, requireAuth, sameOrigin, killSessions,
+  listTokens, createApiToken, revokeApiToken, revokeAllApiTokens, verifyApiToken,
   rateLimited, recordFailure, clearFailures, atLeast, role, rw,
   totpBegin, totpEnable, totpDisable, regenBackup, verifySecond, has2fa, issueTicket, takeTicket, dropTicket,
   _hotp: hotp, _counterNow: counterNow,

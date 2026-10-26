@@ -235,6 +235,52 @@ async function info() {
 }
 
 
+
+let gpuCache = { at: 0, data: null };
+async function gpu() {
+  // nvidia-smi is optional; cache briefly so a missing binary does not spam every tick.
+  if (Date.now() - gpuCache.at < 2500 && gpuCache.data !== undefined) return gpuCache.data;
+  const r = await host.run('nvidia-smi', [
+    '--query-gpu=name,utilization.gpu,memory.used,memory.total,temperature.gpu',
+    '--format=csv,noheader,nounits',
+  ], { timeout: 4000 });
+  let data = null;
+  if (r.code === 0 && r.stdout.trim()) {
+    const gpus = [];
+    for (const line of r.stdout.trim().split('\n')) {
+      const p = line.split(',').map((s) => s.trim());
+      if (p.length < 2 || !p[0] || /NVIDIA-SMI|failed|not found/i.test(p[0])) continue;
+      const num = (i) => {
+        if (p[i] == null || p[i] === '' || /\[N\/A\]/i.test(p[i])) return null;
+        const n = Number(p[i]);
+        return Number.isFinite(n) ? n : null;
+      };
+      const util = num(1), mu = num(2), mt = num(3), temp = num(4);
+      gpus.push({
+        name: p[0],
+        util,
+        memUsed: mu == null ? null : mu * 1024 * 1024,
+        memTotal: mt == null ? null : mt * 1024 * 1024,
+        temp,
+      });
+    }
+    if (gpus.length) {
+      const utils = gpus.map((g) => g.util).filter((v) => v != null);
+      data = {
+        name: gpus[0].name + (gpus.length > 1 ? ` +${gpus.length - 1}` : ''),
+        util: utils.length ? utils.reduce((a, b) => a + b, 0) / utils.length : null,
+        memUsed: gpus.reduce((a, g) => a + (g.memUsed || 0), 0) || null,
+        memTotal: gpus.reduce((a, g) => a + (g.memTotal || 0), 0) || null,
+        temp: gpus[0].temp,
+        count: gpus.length,
+        devices: gpus,
+      };
+    }
+  }
+  gpuCache = { at: Date.now(), data };
+  return data;
+}
+
 let lastDiskIo = null;
 async function diskIo() {
   const t = await read(path.join(host.PROC, 'diskstats'));
@@ -268,14 +314,19 @@ async function diskIo() {
 }
 
 async function snapshot() {
-  const [c, m, n, t, diskInfo, i, up, load, dio] = await Promise.all([
+  const [c, m, n, t, diskInfo, i, up, load, dio, g] = await Promise.all([
     cpu(), memory(), network(), temps(), disks(), info(),
-    read('/proc/uptime'), read('/proc/loadavg'), diskIo(),
+    read('/proc/uptime'), read('/proc/loadavg'), diskIo(), gpu(),
   ]);
   const la = load.trim().split(/\s+/);
+  // Prefer a package/CPU thermal reading for the overview CPU card (Connect parity).
+  const cpuTempPref = /x86_pkg|cpu-thermal|cpu_thermal|soc_thermal|k10temp|coretemp|cpu|pkg/i;
+  const cpuTempHit = (t || []).find((x) => cpuTempPref.test(x.sensor) || cpuTempPref.test(x.label));
+  const cpuTemp = cpuTempHit ? cpuTempHit.celsius : (t && t[0] ? t[0].celsius : null);
   return {
-    time: Date.now(), cpu: c, memory: m, network: n, temps: t,
+    time: Date.now(), cpu: c, memory: m, network: n, temps: t, cpuTemp,
     disks: diskInfo.disks, primaryDisk: diskInfo.primary, diskTotal: diskInfo.total, diskIo: dio, info: i,
+    gpu: g,
     uptime: Number(up.split(' ')[0]) || 0,
     load: [Number(la[0]) || 0, Number(la[1]) || 0, Number(la[2]) || 0],
     procs: la[3] || '',

@@ -86,6 +86,7 @@ function widgetsHtml() {
       ${val('disk', 'disku')}
       <div class="widget-sub muted small ellipsis" data-w="disksub"></div>
       <div data-w="diskbar"></div>
+      <div class="widget-sub muted small ellipsis" data-w="diskio" style="margin-top:6px"></div>
     </button>
     <button type="button" class="card widget widget-click" data-expand="net" title="Expand Network">
       <div class="widget-top"><div class="label">Network</div></div>
@@ -95,6 +96,12 @@ function widgetsHtml() {
       </div>
       <canvas class="spark" data-w="netspark"></canvas>
     </button>
+    <button type="button" class="card widget widget-click hidden" data-expand="gpu" data-gpu-widget title="Expand GPU">
+      <div class="widget-top"><div class="label">GPU</div><div class="widget-ring" data-w="gpuring"></div></div>
+      ${val('gpu', 'gpuu')}
+      <div class="widget-sub muted small ellipsis" data-w="gpusub"></div>
+      <canvas class="spark" data-w="gpuspark"></canvas>
+    </button>
   </div>`;
 }
 function updateWidgets(root, d) {
@@ -102,7 +109,8 @@ function updateWidgets(root, d) {
   if (!w('cpu')) return;
   const memPct = d.memory.total ? (d.memory.used / d.memory.total) * 100 : 0;
   setVal(root, 'cpu', fmtNum(d.cpu.usage, 0) + '%', '');
-  w('load').textContent = `load ${d.load.map((x) => fmtNum(x, 2)).join(' ')}`;
+  const cpuTemp = d.cpuTemp != null ? ` · ${fmtNum(d.cpuTemp, 0)}°C` : '';
+  w('load').textContent = `load ${d.load.map((x) => fmtNum(x, 2)).join(' ')}${cpuTemp}`;
   w('cpuring').innerHTML = ring(d.cpu.usage, d.info.cpuCount + 'c');
   const mem = splitBytes(d.memory.used, 1);
   setVal(root, 'mem', mem.num, mem.unit);
@@ -119,9 +127,28 @@ function updateWidgets(root, d) {
     w('disksub').textContent = `of ${fmtBytes(root0.size, 1)} on ${root0.mount} · ${freeBits}`;
     w('diskbar').innerHTML = bar(p);
   } else { setVal(root, 'disk', 'n/a', ''); w('disksub').textContent = ''; }
+  const dio = d.diskIo || {};
+  const dioEl = w('diskio');
+  if (dioEl) dioEl.textContent = (dio.readRate != null || dio.writeRate != null)
+    ? `IO ↓ ${fmtRate(dio.readRate || 0)} · ↑ ${fmtRate(dio.writeRate || 0)}` : '';
   const rx = splitRate(d.network.rxRate), tx = splitRate(d.network.txRate);
   setVal(root, 'rx', rx.num, rx.unit);
   setVal(root, 'tx', tx.num, tx.unit);
+  const gpuW = root.querySelector('[data-gpu-widget]');
+  if (gpuW) {
+    if (d.gpu) {
+      gpuW.classList.remove('hidden');
+      setVal(root, 'gpu', d.gpu.util == null ? '–' : fmtNum(d.gpu.util, 0) + '%', '');
+      const bits = [d.gpu.name];
+      if (d.gpu.memTotal) bits.push(`${fmtBytes(d.gpu.memUsed)} / ${fmtBytes(d.gpu.memTotal)}`);
+      if (d.gpu.temp != null) bits.push(`${fmtNum(d.gpu.temp, 0)}°C`);
+      w('gpusub').textContent = bits.filter(Boolean).join(' · ');
+      w('gpuring').innerHTML = ring(d.gpu.util || 0, d.gpu.count > 1 ? d.gpu.count + '×' : 'GPU');
+      sparkline(w('gpuspark'), [Stats.history.gpu], { max: 100, colors: ['#a78bfa'] });
+    } else {
+      gpuW.classList.add('hidden');
+    }
+  }
   sparkline(w('cpuspark'), [Stats.history.cpu], { max: 100 });
   sparkline(w('memspark'), [Stats.history.mem], { max: 100, colors: ['#22c1c3'] });
   sparkline(w('netspark'), [Stats.history.rx, Stats.history.tx], { colors: ['#7c5cff', '#f472b6'] });
@@ -129,8 +156,8 @@ function updateWidgets(root, d) {
 
 /** Expanded live view for a home/dashboard widget. History is held in-browser only while open. */
 function openStatExpand(kind) {
-  const titles = { cpu: 'CPU', mem: 'Memory', disk: 'Storage', net: 'Network' };
-  const hist = { cpu: [], mem: [], rx: [], tx: [] };
+  const titles = { cpu: 'CPU', mem: 'Memory', disk: 'Storage', net: 'Network', gpu: 'GPU' };
+  const hist = { cpu: [], mem: [], rx: [], tx: [], gpu: [] };
   const cap = 100; // ~5 min at 3s
   let unsub = null, timer = null, procs = [];
 
@@ -139,6 +166,7 @@ function openStatExpand(kind) {
     if (kind === 'cpu') hist.cpu = h.cpu.slice(-cap);
     if (kind === 'mem') hist.mem = h.mem.slice(-cap);
     if (kind === 'net') { hist.rx = h.rx.slice(-cap); hist.tx = h.tx.slice(-cap); }
+    if (kind === 'gpu') hist.gpu = (h.gpu || []).slice(-cap);
   };
   seed();
 
@@ -159,6 +187,7 @@ function openStatExpand(kind) {
       body.innerHTML = `
         <div class="row wrap" style="gap:16px;margin-bottom:12px">
           <div><div class="label">Usage</div><div class="big num">${fmtPct(d.cpu.usage, 1)}</div></div>
+          <div><div class="label">Temp</div><div class="big num" style="font-size:22px">${d.cpuTemp != null ? fmtNum(d.cpuTemp, 0) + ' °C' : '–'}</div></div>
           <div class="grow"><div class="label">Load average</div><div class="num">${d.load.map((x) => fmtNum(x, 2)).join(' · ')}</div>
             <div class="muted small">1 / 5 / 15 min</div></div>
         </div>
@@ -225,6 +254,25 @@ function openStatExpand(kind) {
             <td class="right muted num">${fmtBytes(i.rxBytes)} / ${fmtBytes(i.txBytes)}</td></tr>`).join('') || '<tr><td colspan="4" class="muted">No interfaces</td></tr>'}
         </tbody></table>`;
       sparkline($('[data-chart]', body), [hist.rx, hist.tx], { colors: ['#7c5cff', '#f472b6'] });
+    } else if (kind === 'gpu') {
+      if (!d.gpu) { body.innerHTML = '<div class="muted">No NVIDIA GPU reported (nvidia-smi not available on this host).</div>'; return; }
+      hist.gpu.push(d.gpu.util == null ? 0 : d.gpu.util); while (hist.gpu.length > cap) hist.gpu.shift();
+      const g = d.gpu;
+      body.innerHTML = `
+        <div class="row wrap" style="gap:16px;margin-bottom:12px">
+          <div><div class="label">Utilisation</div><div class="big num">${g.util == null ? '–' : fmtPct(g.util, 0)}</div></div>
+          <div><div class="label">VRAM</div><div class="big num" style="font-size:22px">${g.memTotal ? `${fmtBytes(g.memUsed)} / ${fmtBytes(g.memTotal)}` : 'n/a'}</div></div>
+          <div><div class="label">Temp</div><div class="big num" style="font-size:22px">${g.temp != null ? fmtNum(g.temp, 0) + ' °C' : '–'}</div></div>
+        </div>
+        <div class="muted small" style="margin-bottom:8px">${esc(g.name)}${g.count > 1 ? ` · ${g.count} GPUs` : ''}</div>
+        <div style="margin-bottom:12px">${bar(g.util || 0)}</div>
+        <canvas class="spark expand-chart" data-chart height="120" style="margin-bottom:14px"></canvas>
+        ${(g.devices || []).length > 1 ? `<table><thead><tr><th>GPU</th><th class="right">Util</th><th class="right">VRAM</th><th class="right">Temp</th></tr></thead><tbody>
+          ${g.devices.map((x, i) => `<tr><td class="ellipsis">${esc(x.name || ('GPU ' + i))}</td><td class="right num">${x.util == null ? '–' : fmtNum(x.util, 0) + '%'}</td>
+            <td class="right num">${x.memTotal ? `${fmtBytes(x.memUsed)} / ${fmtBytes(x.memTotal)}` : '–'}</td>
+            <td class="right num">${x.temp != null ? fmtNum(x.temp, 0) + '°C' : '–'}</td></tr>`).join('')}
+        </tbody></table>` : ''}`;
+      sparkline($('[data-chart]', body), [hist.gpu], { max: 100, colors: ['#a78bfa'] });
     }
   };
 
@@ -257,6 +305,7 @@ Pages.dashboard = (el) => {
     <div class="card"><div class="card-title">${ICON.globe} Network interfaces</div><div data-k="net"></div></div>
     <div class="card"><div class="card-title">🌡️ Temperatures</div><div data-k="temps"></div></div>
     <div class="card"><div class="card-title">${ICON.disk} Memory &amp; swap</div><div data-k="mem"></div></div>
+    <div class="card hidden" data-gpu-card><div class="card-title">GPU</div><div data-k="gpu"></div></div>
   </div>`;
   bindWidgetClicks(el);
   const k = (n) => $(`[data-k="${n}"]`, el);
@@ -276,6 +325,20 @@ Pages.dashboard = (el) => {
       <div class="kv small" style="margin-bottom:12px"><div>Cached</div><div class="num">${fmtBytes(m.cached||0)}</div><div>Buffers</div><div class="num">${fmtBytes(m.buffers||0)}</div><div>Free</div><div class="num">${fmtBytes(m.free||0)}</div></div>
       <div class="row small"><span class="grow">Swap</span><span class="num">${m.swapTotal ? `${fmtBytes(m.swapUsed)} / ${fmtBytes(m.swapTotal)}` : 'none'}</span></div><div style="margin-top:6px">${bar(m.swapTotal ? (m.swapUsed / m.swapTotal) * 100 : 0)}</div>
       <div class="muted small" style="margin-top:12px">${fmtBytes(m.available)} available</div>`;
+    const gpuCard = el.querySelector('[data-gpu-card]');
+    if (gpuCard) {
+      if (d.gpu) {
+        gpuCard.classList.remove('hidden');
+        const g = d.gpu;
+        k('gpu').innerHTML = `<div class="row small"><span class="grow ellipsis">${esc(g.name)}</span><b class="num">${g.util == null ? '–' : fmtNum(g.util, 0) + '%'}</b></div>
+          <div style="margin:6px 0 12px">${bar(g.util || 0)}</div>
+          <div class="kv small"><div>VRAM</div><div class="num">${g.memTotal ? `${fmtBytes(g.memUsed)} / ${fmtBytes(g.memTotal)}` : 'n/a'}</div>
+          <div>Temp</div><div class="num">${g.temp != null ? fmtNum(g.temp, 0) + ' °C' : '–'}</div>
+          <div>Devices</div><div class="num">${g.count || 1}</div></div>`;
+      } else {
+        gpuCard.classList.add('hidden');
+      }
+    }
   });
   return unsub;
 };

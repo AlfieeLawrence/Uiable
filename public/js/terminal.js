@@ -2,8 +2,16 @@
 /* Web terminal with tabs (xterm.js + host PTY over websocket). Sessions survive page switches. */
 const Term = { tabs: [], active: null, seq: 0 };
 
+const TERM_THEMES = {
+  dark: { background: '#0b0d14', foreground: '#e8eaf2', cursor: '#7c5cff', selectionBackground: '#7c5cff55' },
+  light: { background: '#fafbfe', foreground: '#1a1c26', cursor: '#5b3df5', selectionBackground: '#5b3df555' },
+  solarized: { background: '#002b36', foreground: '#839496', cursor: '#93a1a1', selectionBackground: '#07364288' },
+  dracula: { background: '#282a36', foreground: '#f8f8f2', cursor: '#bd93f9', selectionBackground: '#44475a88' },
+  monokai: { background: '#272822', foreground: '#f8f8f2', cursor: '#f92672', selectionBackground: '#49483e88' },
+};
 function termTheme() {
-  return { background: '#0d0f17', foreground: '#e6e8ef', cursor: '#a78bfa', selectionBackground: '#7c5cff55', black: '#1b1e2b', brightBlack: '#5c6370', red: '#f87171', green: '#4ade80', yellow: '#facc15', blue: '#60a5fa', magenta: '#c084fc', cyan: '#22d3ee', white: '#e5e7eb' };
+  const base = { black: '#1b1e2b', brightBlack: '#5c6370', red: '#f87171', green: '#4ade80', yellow: '#facc15', blue: '#60a5fa', magenta: '#c084fc', cyan: '#22d3ee', white: '#e5e7eb' };
+  return Object.assign({}, base, TERM_THEMES[resolveTheme()] || TERM_THEMES.dark);
 }
 
 function newTab(user) {
@@ -76,3 +84,8 @@ Pages.terminal = (el) => {
   if (!Term.tabs.length || sessionStorage.getItem('uiable-term-cd')) add(); else show(Term.active || Term.tabs[0].id);
   return () => { window.removeEventListener('resize', onResize); ro.disconnect(); };
 };
+
+window.addEventListener('uiable-theme', () => {
+  const th = termTheme();
+  Term.tabs.forEach((tab) => { try { tab.term.options.theme = th; } catch (_) {} });
+});

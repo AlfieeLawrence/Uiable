@@ -185,4 +185,242 @@ router.post('/images/apply', wrap(async (req, res) => {
   res.json({ ok: true, job: jobs.view(job) });
 }));
 
+
+// ---- Uiable agent self-update (GitHub releases) ----
+const REPO = () => process.env.UIABLE_UPDATE_REPO || 'AlfieeLawrence/uiable';
+const https = require('https');
+
+function currentVersion() {
+  try { return require('../BUILD_INFO.json').version; } catch (_) {}
+  try { return require('../package.json').version; } catch (_) {}
+  return '0.0.0';
+}
+
+function ghGet(path) {
+  return new Promise((resolve, reject) => {
+    const req = https.request({
+      hostname: 'api.github.com', path, method: 'GET',
+      headers: {
+        'User-Agent': 'Uiable-SelfUpdater',
+        'Accept': 'application/vnd.github+json',
+        ...(process.env.GITHUB_TOKEN ? { Authorization: 'Bearer ' + process.env.GITHUB_TOKEN } : {}),
+      },
+      timeout: 20000,
+    }, (res) => {
+      let d = '';
+      res.on('data', (x) => { if (d.length < 5e6) d += x; });
+      res.on('end', () => {
+        if (res.statusCode >= 400) return reject(new Error('GitHub HTTP ' + res.statusCode + ': ' + d.slice(0, 200)));
+        try { resolve(JSON.parse(d)); } catch (e) { reject(e); }
+      });
+    });
+    req.on('error', reject);
+    req.on('timeout', () => req.destroy(new Error('timeout')));
+    req.end();
+  });
+}
+
+function cmpVer(a, b) {
+  const pa = String(a).replace(/^v/, '').split('.').map((x) => parseInt(x, 10) || 0);
+  const pb = String(b).replace(/^v/, '').split('.').map((x) => parseInt(x, 10) || 0);
+  for (let i = 0; i < 3; i++) {
+    const d = (pa[i] || 0) - (pb[i] || 0);
+    if (d) return d > 0 ? 1 : -1;
+  }
+  return 0;
+}
+
+
+async function fetchRelease(tag) {
+  const repo = REPO();
+  if (tag && tag !== 'latest') {
+    return ghGet('/repos/' + repo + '/releases/tags/' + encodeURIComponent(tag.startsWith('v') ? tag : 'v' + tag));
+  }
+  return ghGet('/repos/' + repo + '/releases/latest');
+}
+
+function pickAsset(rel) {
+  const assets = rel.assets || [];
+  const pkg = assets.find((a) => /\.(tar\.gz|tgz|zip)$/i.test(a.name)) || null;
+  const sum = assets.find((a) => /sha256|checksums?\.txt$/i.test(a.name))
+    || assets.find((a) => pkg && a.name === pkg.name + '.sha256')
+    || assets.find((a) => pkg && a.name === pkg.name + '.sha256sum')
+    || null;
+  return { pkg, sum };
+}
+
+async function fetchTextUrl(url) {
+  const https = require('https');
+  const http = require('http');
+  return new Promise((resolve, reject) => {
+    const lib = String(url).startsWith('http:') ? http : https;
+    const req = lib.get(url, { headers: { 'User-Agent': 'uiable', Accept: 'application/octet-stream' }, timeout: 60000 }, (res) => {
+      if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+        return fetchTextUrl(res.headers.location).then(resolve, reject);
+      }
+      let d = '';
+      res.on('data', (x) => { if (d.length < 2e6) d += x; });
+      res.on('end', () => res.statusCode >= 400 ? reject(new Error('HTTP ' + res.statusCode)) : resolve(d));
+    });
+    req.on('error', reject);
+    req.on('timeout', () => req.destroy(new Error('timeout')));
+  });
+}
+
+function parseChecksum(text, assetName) {
+  if (!text) return null;
+  const lines = text.trim().split(/\r?\n/);
+  for (const line of lines) {
+    const m = line.match(/([a-fA-F0-9]{64})\s+\*?(\S+)/) || line.match(/^([a-fA-F0-9]{64})\s*$/);
+    if (!m) continue;
+    if (!m[2] || m[2] === assetName || m[2].endsWith('/' + assetName) || assetName.endsWith(m[2])) return m[1].toLowerCase();
+    if (lines.length === 1) return m[1].toLowerCase();
+  }
+  // bare hash file
+  const bare = text.trim().match(/^([a-fA-F0-9]{64})$/m);
+  return bare ? bare[1].toLowerCase() : null;
+}
+
+function installDir() { return process.env.UIABLE_DIR || '/opt/uiable'; }
+function backupDir() { return process.env.UIABLE_BACKUP_DIR || (installDir() + '.bak'); }
+function healthUrl() {
+  return process.env.UIABLE_HEALTH_URL || ('http://127.0.0.1:' + (process.env.UIABLE_PORT || process.env.PORT || '8080') + '/api/health');
+}
+
+router.get('/self', wrap(async (req, res) => {
+  const current = currentVersion();
+  const repo = REPO();
+  const pin = req.query.version || req.query.tag || null;
+  try {
+    const rel = await fetchRelease(pin);
+    const latest = (rel.tag_name || rel.name || '').replace(/^v/, '');
+    const { pkg, sum } = pickAsset(rel);
+    const bak = backupDir();
+    let rollbackReady = false;
+    try {
+      const st = await host.run('sh', ['-c', 'test -d "$0" && test -f "$0/package.json" && echo yes', bak], { timeout: 5000 });
+      rollbackReady = (st.stdout || '').includes('yes');
+    } catch (_) {}
+    res.json({
+      available: true,
+      current,
+      latest,
+      pinned: pin || null,
+      update: latest ? cmpVer(latest, current) > 0 : false,
+      name: rel.name || rel.tag_name,
+      url: rel.html_url,
+      publishedAt: rel.published_at,
+      asset: pkg ? { name: pkg.name, size: pkg.size, url: pkg.browser_download_url } : null,
+      checksumAsset: sum ? { name: sum.name, url: sum.browser_download_url } : null,
+      repo,
+      rollbackReady,
+      backupDir: bak,
+      note: 'Apply pins a release, verifies sha256 when published, health-checks, then swaps. Rollback restores the previous tree.',
+    });
+  } catch (e) {
+    res.json({ available: false, current, repo, message: e.message, update: false });
+  }
+}));
+
+router.post('/self/apply', wrap(async (req, res) => {
+  const current = currentVersion();
+  const repo = REPO();
+  const pin = (req.body && (req.body.version || req.body.tag)) || null;
+  const rel = await fetchRelease(pin);
+  const latest = (rel.tag_name || '').replace(/^v/, '');
+  if (!latest) throw bad('No release tag');
+  if (!pin && cmpVer(latest, current) <= 0) throw bad('Already up to date (current ' + current + ')');
+  const { pkg, sum } = pickAsset(rel);
+  const url = pkg ? pkg.browser_download_url : (rel.tarball_url || null);
+  if (!url) throw bad('No downloadable asset on release', 404);
+  let expectSha = null;
+  if (sum && sum.browser_download_url) {
+    try {
+      const txt = await fetchTextUrl(sum.browser_download_url);
+      expectSha = parseChecksum(txt, pkg ? pkg.name : '');
+    } catch (e) {
+      throw bad('Checksum asset present but could not be fetched: ' + e.message, 502);
+    }
+    if (!expectSha) throw bad('Checksum asset present but no sha256 found for ' + (pkg && pkg.name), 502);
+  }
+  const dest = installDir();
+  const bak = backupDir();
+  const job = jobs.runFn('Uiable self-update to ' + latest, req.session.username, async (log) => {
+    log('Current: ' + current + ' → ' + latest + (pin ? ' (pinned)' : '') + '\n');
+    log('Downloading ' + url + '\n');
+    const tmp = '/tmp/uiable-update-' + Date.now();
+    await host.run('mkdir', ['-p', tmp], { timeout: 5000 });
+    const dl = await host.run('sh', ['-c', 'curl -fsSL "$0" -o "$1/pkg" || wget -qO "$1/pkg" "$0"', url, tmp], { timeout: 10 * 60 * 1000 });
+    if (dl.code !== 0) throw new Error('Download failed: ' + (dl.stderr || dl.stdout));
+    if (expectSha) {
+      log('Verifying sha256 ' + expectSha.slice(0, 12) + '…\n');
+      const hs = await host.run('sha256sum', [tmp + '/pkg'], { timeout: 120000 });
+      const got = ((hs.stdout || '').trim().split(/\s+/)[0] || '').toLowerCase();
+      if (got !== expectSha) throw new Error('Checksum mismatch: got ' + got + ' expected ' + expectSha);
+      log('Checksum OK\n');
+    } else {
+      log('No checksum asset on release — skipping verify\n');
+    }
+    // Stage extract for health peek
+    const stage = tmp + '/stage';
+    await host.run('mkdir', ['-p', stage], { timeout: 5000 });
+    let ex;
+    if (pkg && /\.zip$/i.test(pkg.name)) {
+      ex = await host.run('sh', ['-c', 'unzip -qo "$0/pkg" -d "$0/x" && cp -a "$0/x"/. "$1"/', tmp, stage], { timeout: 5 * 60 * 1000 });
+    } else {
+      ex = await host.run('sh', ['-c', 'tar -xzf "$0/pkg" -C "$0" && src=$(find "$0" -maxdepth 2 -type d -name server | head -1 | xargs dirname) && cp -a "$src"/. "$1"/', tmp, stage], { timeout: 5 * 60 * 1000 });
+    }
+    if (ex.code !== 0) throw new Error('Extract failed: ' + (ex.stderr || ex.stdout));
+    const peek = await host.run('sh', ['-c', 'test -f "$0/package.json" && test -d "$0/server" && echo ok', stage], { timeout: 5000 });
+    if (!(peek.stdout || '').includes('ok')) throw new Error('Health-check before swap failed: package.json/server missing in archive');
+    log('Pre-swap archive health-check OK\n');
+    // Backup current install for rollback
+    log('Backing up ' + dest + ' → ' + bak + '\n');
+    await host.run('sh', ['-c', 'rm -rf "$1" && mkdir -p "$1" && if [ -d "$0" ]; then cp -a "$0"/. "$1"/; fi', dest, bak], { timeout: 5 * 60 * 1000 });
+    log('Installing into ' + dest + '\n');
+    const inst = await host.run('sh', ['-c', 'mkdir -p "$0" && cp -a "$1"/. "$0"/', dest, stage], { timeout: 5 * 60 * 1000 });
+    if (inst.code !== 0) throw new Error('Install copy failed');
+    log('Rebuilding container...\n');
+    const up = await host.run('sh', ['-c', 'cd "$0" && (docker compose up -d --build || docker-compose up -d --build)', dest], { timeout: 20 * 60 * 1000 });
+    log((up.stdout || '') + (up.stderr || ''));
+    if (up.code !== 0) throw new Error('compose up failed — try POST /updates/self/rollback');
+    // Post-swap health
+    log('Waiting for health at ' + healthUrl() + '\n');
+    let healthy = false;
+    for (let i = 0; i < 30; i++) {
+      await new Promise((r) => setTimeout(r, 2000));
+      const h = await host.run('sh', ['-c', 'curl -fsS -o /dev/null -w "%{http_code}" "$0" || wget -qO- "$0" >/dev/null && echo 200', healthUrl()], { timeout: 10000 });
+      if ((h.stdout || '').includes('200') || (h.stdout || '').trim() === '200') { healthy = true; break; }
+    }
+    if (!healthy) {
+      log('Post-swap health-check failed — automatic rollback\n');
+      const rb = await host.run('sh', ['-c', 'if [ -d "$1" ]; then rm -rf "$0"/* "$0"/.[!.]* 2>/dev/null; cp -a "$1"/. "$0"/; cd "$0" && (docker compose up -d --build || docker-compose up -d --build); fi', dest, bak], { timeout: 20 * 60 * 1000 });
+      log((rb.stdout || '') + (rb.stderr || ''));
+      throw new Error('Health-check failed after swap; rolled back to previous install');
+    }
+    log('Healthy. New version should be ' + latest + '\n');
+    await host.run('rm', ['-rf', tmp], { timeout: 10000 });
+  });
+  audit.write({ user: req.session.username, action: 'updates.self.apply', details: { from: current, to: latest, pin, checksum: !!expectSha, job: job.id } });
+  res.json({ ok: true, job: jobs.view(job), to: latest, checksum: !!expectSha });
+}));
+
+router.post('/self/rollback', wrap(async (req, res) => {
+  const dest = installDir();
+  const bak = backupDir();
+  const job = jobs.runFn('Uiable rollback', req.session.username, async (log) => {
+    const check = await host.run('sh', ['-c', 'test -d "$0" && test -f "$0/package.json" && echo yes', bak], { timeout: 5000 });
+    if (!(check.stdout || '').includes('yes')) throw new Error('No rollback tree at ' + bak);
+    log('Restoring ' + bak + ' → ' + dest + '\n');
+    const r = await host.run('sh', ['-c', 'mkdir -p "$0" && rm -rf "$0"/* "$0"/.[!.]* 2>/dev/null; cp -a "$1"/. "$0"/ && cd "$0" && (docker compose up -d --build || docker-compose up -d --build)', dest, bak], { timeout: 20 * 60 * 1000 });
+    log((r.stdout || '') + (r.stderr || ''));
+    if (r.code !== 0) throw new Error('Rollback compose failed');
+    log('Rollback complete\n');
+  });
+  audit.write({ user: req.session.username, action: 'updates.self.rollback', details: { job: job.id } });
+  res.json({ ok: true, job: jobs.view(job) });
+}));
+
+
+
 module.exports = Object.assign(router, { hostPackages, imageUpdates });

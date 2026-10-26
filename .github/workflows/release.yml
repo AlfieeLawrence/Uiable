@@ -1,0 +1,149 @@
+name: Release
+
+# Builds distribute archives (+ optional GHCR image) and attaches them to the GitHub release for the tag.
+# Cut a release with:  git tag -a v1.2.0 -m "Uiable 1.2.0" && git push origin main --tags
+# workflow_dispatch builds artifacts; publishes a release only when a tag is given or the ref is a v* tag.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing or new tag to publish to (leave empty to only build)'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            T="${GITHUB_REF_NAME}"
+          else
+            T="${{ inputs.tag }}"
+            [ -n "$T" ] || T="dev"
+          fi
+          VER="${T#v}"
+          echo "tag=$T" >> "$GITHUB_OUTPUT"
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+      - name: Stamp BUILD_INFO.json
+        run: |
+          node -e "
+            const fs=require('fs');
+            const ver='${{ steps.v.outputs.version }}';
+            const info={ version: ver === 'dev' ? require('./package.json').version : ver, date: new Date().toISOString().replace(/\.\d+Z$/,'Z'), git: process.env.GITHUB_SHA || '' };
+            fs.writeFileSync('BUILD_INFO.json', JSON.stringify(info)+'\n');
+            console.log(info);
+          "
+      - name: Sync package.json version on tagged builds
+        if: steps.v.outputs.version != 'dev'
+        run: |
+          node -e "
+            const fs=require('fs');
+            const p=JSON.parse(fs.readFileSync('package.json','utf8'));
+            p.version='${{ steps.v.outputs.version }}';
+            fs.writeFileSync('package.json', JSON.stringify(p,null,2)+'\n');
+          "
+      - name: Build uiable.zip and uiable.tar.gz (top-level uiable/)
+        run: |
+          set -euo pipefail
+          VER="${{ steps.v.outputs.version }}"
+          STAGE=$(mktemp -d)
+          mkdir -p "$STAGE/uiable"
+          # Distribute source + compose (image builds on the host via compose --build)
+          rsync -a \
+            --exclude node_modules --exclude data --exclude .git --exclude '.github' \
+            --exclude '*.log' --exclude .env --exclude 'docs/ref' \
+            ./ "$STAGE/uiable/"
+          mkdir -p dist
+          (cd "$STAGE" && zip -qry "$GITHUB_WORKSPACE/dist/uiable-${VER}.zip" uiable)
+          (cd "$STAGE" && tar -czf "$GITHUB_WORKSPACE/dist/uiable-${VER}.tar.gz" uiable)
+          # Stable names expected by README / install one-liners
+          cp "dist/uiable-${VER}.zip" dist/uiable.zip
+          cp "dist/uiable-${VER}.tar.gz" dist/uiable.tar.gz
+          # Checksums
+          (cd dist && sha256sum uiable.zip uiable.tar.gz "uiable-${VER}.zip" "uiable-${VER}.tar.gz" > checksums.txt)
+          ls -la dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package
+          path: |
+            dist/uiable.zip
+            dist/uiable.tar.gz
+            dist/uiable-*.zip
+            dist/uiable-*.tar.gz
+            dist/checksums.txt
+          if-no-files-found: error
+
+  docker:
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.tag != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        run: |
+          T="${{ inputs.tag || github.ref_name }}"
+          echo "version=${T#v}" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/$(echo '${{ github.repository }}' | tr 'A-Z' 'a-z')" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with: { registry: ghcr.io, username: '${{ github.actor }}', password: '${{ secrets.GITHUB_TOKEN }}' }
+      - uses: docker/build-push-action@v6
+        env: { DOCKER_BUILD_RECORD_UPLOAD: 'false', DOCKER_BUILD_SUMMARY: 'false' }
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ steps.v.outputs.image }}:${{ steps.v.outputs.version }}
+            ${{ steps.v.outputs.image }}:latest
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.v.outputs.version }}
+            org.opencontainers.image.description=Uiable — self-hosted Linux server dashboard
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  release:
+    needs: [package]
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.tag != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { path: artifacts, merge-multiple: true, pattern: 'package' }
+      - run: ls -la artifacts
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          name: Uiable ${{ inputs.tag || github.ref_name }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            artifacts/uiable.zip
+            artifacts/uiable.tar.gz
+            artifacts/uiable-*.zip
+            artifacts/uiable-*.tar.gz
+            artifacts/checksums.txt
+          body: |
+            **Install:** download `uiable.zip` (or `uiable.tar.gz`), unpack so you get a top-level `uiable/` folder, then `cd uiable && sudo ./install.sh`.
+
+            **Checksums:** see `checksums.txt` (sha256).
+
+            **Docker image (GHCR):** `docker pull ghcr.io/alfieelawrence/uiable:latest` (multi-arch). Compose in the zip still builds `uiable:local` by default for privileged host access.
+
+            **Docs:** https://github.com/AlfieeLawrence/uiable/tree/main/docs
+
+            **Companion:** [Uiable Connect](https://github.com/AlfieeLawrence/Uiable-Connect)
