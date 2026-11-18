@@ -62,7 +62,7 @@ test('parseWpaScanResults + status', () => {
   assert.equal(home.inUse, true); assert.equal(home.channel, '6'); assert.equal(home.signal, 100); assert.equal(home.security, 'WPA2');
   const cafe = n.find((x) => x.ssid === 'Café');
   assert.ok(cafe); assert.equal(cafe.channel, '36'); assert.equal(cafe.security, '');
-  assert.equal(n.find((x) => x.ssid === 'Six').security, 'WPA3 WPA2');
+  assert.equal(n.find((x) => x.ssid === 'Six').security, 'WPA3');
   assert.equal(n.find((x) => x.ssid === 'Six').channel, '1');
 });
 
@@ -661,4 +661,210 @@ test('deviceAction connect wifi via wpa_supplicant / iwd / netplan: saved -> rec
   assert.deepEqual(await h.netb.savedWifi(d, 'wlp3s0', {}), { kind: 'netplan', name: 'Home' });
   await h.netb.deviceAction(d, 'wlp3s0', 'connect');
   assert.ok(h.calls.some((c) => c.join(' ') === 'ip link set dev wlp3s0 up'));
+});
+
+// ---- 1.2.6: WPA3/SAE, conservative failure reasons, NM leftovers, diagnostics
+const iwBss = (mac, ssid, suites, assoc) => `BSS ${mac}(on wlp3s0)${assoc ? ' -- associated' : ''}\n\tfreq: 2437\n\tsignal: -50.00 dBm\n\tSSID: ${ssid}\n\tcapability: ESS Privacy (0x0411)\n` +
+  (suites ? `\tRSN:\t * Version: 1\n\t\t * Group cipher: CCMP\n\t\t * Pairwise ciphers: CCMP\n\t\t * Authentication suites: ${suites}\n\t\t * Capabilities: 16-PTKSA-RC 1-GTKSA-RC MFP-capable (0x008c)\n` : '');
+
+test('security parsing: SAE-only, transition, enterprise (wpa_cli flags + iw scan)', () => {
+  const w = 'bssid / frequency / signal level / flags / ssid\n' +
+    'aa:bb:cc:dd:ee:01\t2437\t-45\t[WPA2-PSK+SAE-CCMP][ESS]\tMixed\n' +
+    'aa:bb:cc:dd:ee:02\t2437\t-45\t[RSN-SAE-CCMP][ESS]\tW3\n' +
+    'aa:bb:cc:dd:ee:03\t2437\t-45\t[WPA2-EAP-CCMP][ESS]\tCorp\n';
+  const n = nb.parseWpaScanResults(w, 'wlan0', '');
+  assert.equal(n.find((x) => x.ssid === 'Mixed').security, 'WPA3 WPA2');
+  assert.equal(n.find((x) => x.ssid === 'W3').security, 'WPA3');
+  assert.match(n.find((x) => x.ssid === 'Corp').security, /802\.1X/);
+  const i = nb.parseIwScan(iwBss('aa:00:00:00:00:01', 'W3', 'SAE') + iwBss('aa:00:00:00:00:02', 'Mixed', 'PSK SAE') + iwBss('aa:00:00:00:00:03', 'Home', 'PSK'), 'wlp3s0');
+  assert.deepEqual(i.map((x) => [x.ssid, x.security]).sort(), [['Home', 'WPA2'], ['Mixed', 'WPA3 WPA2'], ['W3', 'WPA3']]);
+  assert.ok(i.every((x) => !('_rsn' in x)));
+});
+
+test('wifiSecurityPlan', () => {
+  assert.deepEqual(nb.wifiSecurityPlan('WPA3'), { keyMgmt: 'sae', label: 'WPA3 (SAE)' });
+  assert.equal(nb.wifiSecurityPlan('WPA3 WPA2').transition, true);
+  assert.equal(nb.wifiSecurityPlan('WPA2 WPA3').keyMgmt, 'psk');
+  assert.equal(nb.wifiSecurityPlan('WPA2').label, 'WPA2');
+  assert.equal(nb.wifiSecurityPlan('WPA2 802.1X').keyMgmt, 'eap');
+  assert.equal(nb.wifiSecurityPlan('').keyMgmt, 'unknown');
+});
+
+test('buildNetplanDoc: SAE auth block, hex PSK, explicit networkd renderer', () => {
+  const psk = nb.wpaPsk('Home', 'right pass "#: x');
+  const a = nb.buildNetplanDoc(null, { device: 'wlp3s0', wireless: true, wifi: { ssid: 'Home', password: 'right pass "#: x', psk, renderer: 'networkd' } });
+  assert.equal(a.network.wifis.wlp3s0.renderer, 'networkd');
+  assert.equal(a.network.wifis.wlp3s0['access-points'].Home.password, psk);
+  const b = nb.buildNetplanDoc(null, { device: 'wlp3s0', wireless: true, wifi: { ssid: 'W3', password: 'right pass "#: x', psk, keyMgmt: 'sae' } });
+  assert.deepEqual(b.network.wifis.wlp3s0['access-points'].W3.auth, { 'key-management': 'sae', password: 'right pass "#: x' });
+  assert.equal(b.network.wifis.wlp3s0['access-points'].W3.password, undefined);
+  // round-trips through YAML unchanged (quotes, #, colon)
+  assert.equal(yaml.load(yaml.dump(b)).network.wifis.wlp3s0['access-points'].W3.auth.password, 'right pass "#: x');
+});
+
+test('classifier is conservative: only explicit evidence means "wrong password"', () => {
+  const weak = nb.classifyWifiFailure({ log: 'wlp3s0: CTRL-EVENT-DISCONNECTED bssid=aa reason=15\nwlp3s0: CTRL-EVENT-SSID-TEMP-DISABLED id=0 ssid="Home" auth_failures=1 duration=10 reason=CONN_FAILED\n', security: 'WPA2', device: 'wlp3s0' });
+  assert.equal(weak.code, 'handshake-failed');
+  assert.match(weak.message, /Network security: WPA2/);
+  assert.match(weak.message, /Log since this attempt:\n.*reason=15/);
+  const strong = nb.classifyWifiFailure({ log: 'CTRL-EVENT-SSID-TEMP-DISABLED reason=WRONG_KEY\n', security: 'WPA2' });
+  assert.equal(strong.code, 'wrong-password');
+  const conflict = nb.classifyWifiFailure({ log: 'CTRL-EVENT-SSID-TEMP-DISABLED reason=WRONG_KEY\n', keyMismatch: true });
+  assert.equal(conflict.code, 'handshake-failed');
+  assert.equal(nb.classifyWifiFailure({ log: 'Authentication failed\n' }).code, 'handshake-failed');
+  assert.equal(nb.classifyWifiFailure({ log: '' }).code, 'timeout');
+});
+
+test('filterJournalSince drops lines from earlier attempts; scrubDiagnostics masks secrets', () => {
+  const out = '1700000000.100000 host wpa_supplicant[1]: old WRONG_KEY\n1700000010.500000 host wpa_supplicant[1]: new line\nno-timestamp line\n';
+  assert.equal(nb.filterJournalSince(out, 1700000005000), 'host wpa_supplicant[1]: new line\nno-timestamp line');
+  const hex = nb.wpaPsk('Home', 'hunter2hunter2');
+  const t = nb.scrubDiagnostics(`network:\n  wifis:\n    wlp3s0:\n      access-points:\n        "Home":\n          password: "hunter2hunter2"\n  psk=${hex}\nkey: ${hex}\nsae_password="hunter2hunter2"\n`, ['hunter2hunter2']);
+  assert.ok(!t.includes('hunter2hunter2') && !t.includes(hex));
+  assert.match(t, /password: ••••/);
+});
+
+const netplanHost = (root, extra) => fakeHost([
+  [/^nmcli /, { code: 127 }],
+  [/^sh -c for b in/, { stdout: ALFIE_PROBE + 'bin:wpa_supplicant\n' }],
+  [/^sh -c for r in/, { stdout: 'phy0 wlan 0 0\n' }],
+  [/^sh -c pgrep/, { stdout: '901 /sbin/wpa_supplicant -c /run/netplan/wpa-wlp3s0.conf -iwlp3s0 -Dnl80211,wext\n' }],
+  ...extra,
+  [/^netplan /, {}],
+  [/^iw reg get/, { stdout: 'country GB: DFS-ETSI\n' }],
+  [/^ip /, {}],
+], root);
+
+test('netplan WPA3-only: writes key-management sae + renderer networkd, parks stale NM files', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'root-'));
+  fs.mkdirSync(path.join(root, 'etc/netplan'), { recursive: true });
+  fs.mkdirSync(path.join(root, 'etc/NetworkManager/conf.d'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'etc/netplan/90-NM-1234.yaml'), 'network:\n  version: 2\n  wifis:\n    NM-1234:\n      renderer: NetworkManager\n      match: {name: wlp3s0}\n');
+  fs.writeFileSync(path.join(root, 'etc/NetworkManager/conf.d/90-uiable.conf'), '[device]\nwifi.backend=wpa_supplicant\n');
+  let applied = 0;
+  const { netb, calls } = netplanHost(root, [
+    [/^iw dev wlp3s0 scan/, { stdout: iwBss('aa:00:00:00:00:01', 'HomeWifi', 'SAE') }],
+    [/^netplan apply/, () => { applied++; return {}; }],
+    [/^iw dev wlp3s0 link/, () => ({ stdout: applied ? 'Connected to aa:00:00:00:00:01 (on wlp3s0)\n\tSSID: HomeWifi\n\tsignal: -50 dBm\n' : 'Not connected.\n' })],
+    [/^ip -j -4 addr show dev wlp3s0/, () => json([ipAddr('wlp3s0', applied ? { v4: '192.168.1.201/24' } : {})])],
+  ]);
+  const d = await netb.detect(true);
+  assert.deepEqual((await netb.staleNmFiles(d)).sort(), ['etc/NetworkManager/conf.d/90-uiable.conf', 'etc/netplan/90-NM-1234.yaml']);
+  const out = await netb.wifiConnect(d, { ssid: 'HomeWifi', password: 'correct horse 1', device: 'wlp3s0' });
+  assert.match(out.output, /WPA3 \(SAE\)/); assert.equal(out.security, 'WPA3 (SAE)');
+  const e = yaml.load(fs.readFileSync(path.join(root, 'etc/netplan/90-uiable.yaml'), 'utf8')).network.wifis.wlp3s0;
+  assert.equal(e.renderer, 'networkd');
+  assert.deepEqual(e['access-points'].HomeWifi.auth, { 'key-management': 'sae', password: 'correct horse 1' });
+  assert.equal(fs.existsSync(path.join(root, 'etc/netplan/90-NM-1234.yaml')), false, 'stale NM netplan file parked');
+  assert.ok(fs.existsSync(path.join(root, 'etc/netplan/uiable-disabled/90-NM-1234.yaml')));
+  assert.ok(fs.existsSync(path.join(root, 'etc/netplan/uiable-disabled/NetworkManager-90-uiable.conf')));
+  assert.ok(!calls.some((c) => c[0] === 'nmcli' && c[1] !== '-t' && c.includes('managed')));
+});
+
+test('netplan transition network: WPA2 handshake fails -> retries with SAE; failure restores everything', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'root-'));
+  fs.mkdirSync(path.join(root, 'etc/netplan'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'etc/netplan/90-NM-abcd.yaml'), 'network: {version: 2}\n');
+  const written = [];
+  const { netb } = netplanHost(root, [
+    [/^iw dev wlp3s0 scan/, { stdout: iwBss('aa:00:00:00:00:01', 'Mixed', 'PSK SAE') }],
+    [/^netplan apply/, () => { const f = path.join(root, 'etc/netplan/90-uiable.yaml'); written.push(fs.existsSync(f) ? yaml.load(fs.readFileSync(f, 'utf8')) : null); return {}; }],
+    [/^iw dev wlp3s0 link/, { stdout: 'Not connected.\n' }],
+    [/^ip -j -4 addr show dev wlp3s0/, json([ipAddr('wlp3s0')])],
+    [/^journalctl /, { stdout: 'wlp3s0: CTRL-EVENT-DISCONNECTED bssid=aa reason=15\n' }],
+  ]);
+  const d = await netb.detect(true);
+  await assert.rejects(netb.wifiConnect(d, { ssid: 'Mixed', password: 'rightpass1', device: 'wlp3s0' }), (e) => {
+    assert.equal(e.code, 'handshake-failed');
+    assert.doesNotMatch(e.message, /Wrong Wi-Fi password/);
+    assert.match(e.message, /rolled back/); assert.match(e.message, /WPA2\/WPA3 transition, tried SAE/); assert.match(e.message, /reason=15/);
+    assert.ok(!e.message.includes('rightpass1'));
+    return true;
+  });
+  const aps = written.filter(Boolean).map((y) => y.network.wifis.wlp3s0['access-points'].Mixed);
+  assert.equal(aps.length, 2);
+  assert.equal(aps[0].password, nb.wpaPsk('Mixed', 'rightpass1'), 'first: WPA2 with hex PSK');
+  assert.equal(aps[1].auth['key-management'], 'sae', 'second: SAE');
+  assert.ok(fs.existsSync(path.join(root, 'etc/netplan/90-NM-abcd.yaml')), 'parked file restored on failure');
+  assert.equal(fs.existsSync(path.join(root, 'etc/netplan/90-uiable.yaml')), false);
+});
+
+test('wpa_cli WPA3-only: key_mgmt SAE + ieee80211w 2; transition gets PMF optional', async () => {
+  const mk = (flags) => fakeHost([
+    [/^nmcli /, { code: 127 }],
+    [/^sh -c for b in/, { stdout: 'bin:wpa_cli\nbin:ip\nproc:wpa_supplicant\nwifi:wlan0\n' }],
+    [/^sh -c for r in/, { stdout: '' }],
+    [/scan_results/, { stdout: `bssid / frequency / signal level / flags / ssid\naa:bb:cc:dd:ee:01\t2437\t-45\t${flags}\tHome\n` }],
+    [/add_network/, { stdout: '0\n' }],
+    [/save_config/, { stdout: 'OK\n' }],
+    [/wpa_cli -i wlan0 status/, { stdout: 'wpa_state=COMPLETED\nssid=Home\n' }],
+    [/signal_poll/, { stdout: 'RSSI=-50\n' }],
+    [/^wpa_cli /, { stdout: 'OK\n' }],
+    [/^ip -j -4 addr show dev wlan0/, json([ipAddr('wlan0', { v4: '10.0.0.9/24' })])],
+    [/^ip /, {}],
+  ], os.tmpdir());
+  const a = mk('[RSN-SAE-CCMP][ESS]');
+  await a.netb.wifiConnect(await a.netb.detect(true), { ssid: 'Home', password: 'pass phrase"1', device: 'wlan0' });
+  const set = (calls, k) => calls.filter((c) => c[3] === 'set_network' && c[5] === k).map((c) => c[6]);
+  assert.deepEqual(set(a.calls, 'key_mgmt'), ['SAE']); assert.deepEqual(set(a.calls, 'ieee80211w'), ['2']);
+  assert.deepEqual(set(a.calls, 'psk'), ['"pass phrase"1"']);
+  const b = mk('[WPA2-PSK+SAE-CCMP][ESS]');
+  await b.netb.wifiConnect(await b.netb.detect(true), { ssid: 'Home', password: 'pass phrase"1', device: 'wlan0' });
+  assert.deepEqual(set(b.calls, 'psk'), [nb.wpaPsk('Home', 'pass phrase"1')]); assert.deepEqual(set(b.calls, 'ieee80211w'), ['1']);
+  await assert.rejects(a.netb.wifiConnect(await a.netb.detect(true), { ssid: 'Home', password: 'a'.repeat(64), device: 'wlan0' }), /WPA3-only/);
+});
+
+test('two supplicants on one adapter: no "wrong password" claim, conflict reported', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'root-'));
+  const { netb } = fakeHost([
+    [/^nmcli /, { code: 127 }],
+    [/^sh -c for b in/, { stdout: ALFIE_PROBE + 'bin:wpa_supplicant\n' }],
+    [/^sh -c for r in/, { stdout: 'phy0 wlan 0 0\n' }],
+    [/^sh -c pgrep/, { stdout: '901 /sbin/wpa_supplicant -c /run/netplan/wpa-wlp3s0.conf -iwlp3s0\n902 wpa_supplicant -B -i wlp3s0 -c /etc/wpa_supplicant/wpa_supplicant.conf\n' }],
+    [/^iw dev wlp3s0 scan/, { stdout: iwBss('aa:00:00:00:00:01', 'Home', 'PSK') }],
+    [/^netplan /, {}],
+    [/^iw dev wlp3s0 link/, { stdout: 'Not connected.\n' }],
+    [/^iw reg get/, { stdout: 'country GB\n' }],
+    [/^ip -j -4 addr show dev wlp3s0/, json([ipAddr('wlp3s0')])],
+    [/^ip /, {}],
+    [/^journalctl /, { stdout: 'wlp3s0: WPA: 4-Way Handshake failed - pre-shared key may be incorrect\n' }],
+  ], root);
+  await assert.rejects(netb.wifiConnect(await netb.detect(true), { ssid: 'Home', password: 'rightpass1', device: 'wlp3s0' }), (e) => e.code === 'handshake-failed' && /2 wpa_supplicant processes/.test(e.message));
+});
+
+test('nmAdopt: drops Uiable netplan Wi-Fi, re-applies, radio on, device managed', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'root-'));
+  fs.mkdirSync(path.join(root, 'etc/netplan'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'etc/netplan/90-uiable.yaml'), yaml.dump({ network: { version: 2, wifis: { wlp3s0: { dhcp4: true, 'access-points': { Home: { password: 'x'.repeat(64) } } } } } }));
+  const { netb, calls } = fakeHost([
+    [/^sh -c for b in/, { stdout: NM_PROBE + 'bin:netplan\n' }],
+    [/^sh -c for r in/, { stdout: '' }],
+    [/^nmcli /, {}],
+    [/^netplan /, {}],
+  ], root);
+  const d = await netb.detect(true);
+  const log = await netb.nmAdopt(d, ['wlp3s0']);
+  const y = yaml.load(fs.readFileSync(path.join(root, 'etc/netplan/90-uiable.yaml'), 'utf8'));
+  assert.equal((y.network.wifis || {}).wlp3s0, undefined);
+  const k = calls.map((c) => c.join(' '));
+  assert.ok(k.includes('netplan apply')); assert.ok(k.includes('nmcli radio wifi on')); assert.ok(k.includes('nmcli device set wlp3s0 managed yes'));
+  assert.match(log.join('\n'), /now manages wlp3s0/);
+});
+
+test('diagnostics: one read-only script, output scrubbed, stale NM leftovers listed', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'root-'));
+  fs.mkdirSync(path.join(root, 'etc/netplan'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'etc/netplan/90-NM-1.yaml'), 'network: {version: 2}\n');
+  const hex = nb.wpaPsk('Home', 'hunter2hunter2');
+  const { netb, calls } = netplanHost(root, [
+    [/^sh -c .*uiable-diag|^sh -c [\s\S]*rfkill list/, { stdout: `### rfkill\n0: phy0: Wireless LAN\n### netplan get\nwifis:\n  wlp3s0:\n    access-points:\n      Home:\n        password: "hunter2hunter2"\n### wpa\npsk=${hex}\n` }],
+  ]);
+  const d = await netb.detect(true);
+  const out = await netb.diagnostics(d, 'wlp3s0');
+  assert.equal(out.device, 'wlp3s0');
+  assert.ok(!out.text.includes('hunter2hunter2') && !out.text.includes(hex));
+  assert.match(out.text, /rfkill/); assert.match(out.text, /90-NM-1\.yaml/);
+  const diag = calls.find((c) => c[0] === 'sh' && /rfkill list/.test(c[2] || ''));
+  assert.ok(diag, 'ran the diagnostics script');
+  for (const bad of [/netplan apply/, /nmcli .*connect/, /systemctl (start|stop|restart)/, /rm -/]) assert.doesNotMatch(diag[2], bad);
 });

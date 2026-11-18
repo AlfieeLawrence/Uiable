@@ -36,7 +36,12 @@ function runHost(title, user, cmd, args, opts = {}) {
   child.stdout.on('data', (d) => append(job, d.toString()));
   child.stderr.on('data', (d) => append(job, d.toString()));
   child.on('error', (e) => finish(job, 127, e.message));
-  child.on('close', (code) => { if (job.state === 'running') finish(job, code === null ? 137 : code); if (opts.onDone) opts.onDone(job); });
+  child.on('close', async (code) => {
+    // beforeFinish: follow-up steps whose output belongs in the same log (job stays "running" meanwhile)
+    if (opts.beforeFinish && job.state === 'running') { try { await opts.beforeFinish(job, code, (t) => append(job, t)); } catch (e) { append(job, `\n${e.message}\n`); } }
+    if (job.state === 'running') finish(job, code === null ? 137 : code);
+    if (opts.onDone) opts.onDone(job);
+  });
   const timer = setTimeout(() => { try { child.kill('SIGKILL'); } catch (_) {} }, opts.timeout || 30 * 60 * 1000);
   child.on('close', () => clearTimeout(timer));
   return job;

@@ -529,3 +529,9 @@ table .chip, .list-item .chip, .row .chip { min-width: 72px; }
   .toast { max-width: none; }
   .ctr .btns button.sm { padding: 5px 9px; }
 }
+
+/* Dialogs: the page behind never scrolls (core.js lockScroll pins the body; works on iOS too) */
+html.modal-open, html.modal-open body { overflow: hidden; }
+html.modal-open body { position: fixed; left: 0; right: 0; width: 100%; }
+.modal-bg { overscroll-behavior: contain; }
+.modal .body, .modal pre.out, .modal .wifi-list, .modal textarea { overscroll-behavior: contain; }

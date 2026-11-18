@@ -48,7 +48,7 @@ Settings.general = async (b) => {
 const signalBars = (s) => `<span class="signal" title="${s}%">${[20, 45, 65, 85].map((t, i) => `<i class="${s >= t ? 'on' : ''}" style="height:${(i + 1) * 4}px"></i>`).join('')}</span>`;
 
 Settings.network = async (b) => {
-  b.innerHTML = `<div data-conn></div><div data-nmbox></div><div data-wifi class="card section"><div class="card-title">${ICON.wifi} Wi-Fi <span class="spacer"></span><button class="sm" data-scan>${ICON.refresh} Scan</button></div><div data-wlist><span class="spinner"></span></div></div>
+  b.innerHTML = `<div data-conn></div><div data-nmbox></div><div data-wifi class="card section"><div class="card-title">${ICON.wifi} Wi-Fi <span class="spacer"></span><button class="sm" data-diag title="Collect Wi-Fi diagnostics (passwords removed)">${ICON.info} Diagnostics</button><button class="sm" data-scan>${ICON.refresh} Scan</button></div><div data-wlist><span class="spinner"></span></div></div>
     <div class="card section"><div class="card-title">${ICON.globe} Interfaces &amp; IP addresses</div><div data-ifs><span class="spinner"></span></div></div>`;
   let net = null;
   const BK = { networkmanager: 'NetworkManager', iwd: 'iwd', wpa_supplicant: 'wpa_supplicant', netplan: 'netplan', 'systemd-networkd': 'systemd-networkd', ip: 'ip link', iw: 'iw' };
@@ -151,10 +151,23 @@ Settings.network = async (b) => {
   };
   const join = async (ssid, security, device, hidden) => {
     const fields = hidden ? [{ name: 'ssid', label: 'Network name (SSID)' }, { name: 'password', label: 'Password (leave empty if open)', type: 'password' }] : (security && security !== '--' ? [{ name: 'password', label: 'Password', type: 'password' }] : []);
-    const r = fields.length ? await formDlg(`Connect to ${hidden ? 'hidden network' : ssid}`, fields, 'Connect', { intro: 'Uiable waits until the Wi-Fi is joined and has an IP address (up to ~40s) and tells you exactly what went wrong if not.' }) : (await confirmDlg(`Connect to ${esc(ssid)}?`, 'This is an open network.', { okLabel: 'Connect' })) && {};
+    if (fields.some((f) => f.type === 'password')) fields.push({ type: 'html', html: '<label class="row small" style="margin:-4px 0 10px"><input type="checkbox" data-showpw> Show password</label>' });
+    const showPw = (m) => { const c = $('[data-showpw]', m); if (c) c.onchange = () => { const i = $('input[name=password]', m); if (i) i.type = c.checked ? 'text' : 'password'; }; };
+    const r = fields.length ? await formDlg(`Connect to ${hidden ? 'hidden network' : ssid}`, fields, 'Connect', { onOpen: showPw, intro: `${security && security !== '--' ? `Security: <b>${esc(security)}</b>. ` : ''}Uiable waits until the Wi-Fi is joined and has an IP address (up to ~60s) and tells you what went wrong if not.` }) : (await confirmDlg(`Connect to ${esc(ssid)}?`, 'This is an open network.', { okLabel: 'Connect' })) && {};
     if (!r) return;
     const wl = $('[data-wlist]', b); wl.innerHTML = `<span class="spinner"></span> <span class="muted">Connecting to ${esc(hidden ? r.ssid : ssid)} and waiting for an IP address…</span>`;
-    const out = await act(null, () => POST('/system/wifi/connect', { ssid: hidden ? r.ssid : ssid, password: r.password || '', device, hidden: !!hidden }));
+    let out = null;
+    try { out = await POST('/system/wifi/connect', { ssid: hidden ? r.ssid : ssid, password: r.password || '', device, hidden: !!hidden }); }
+    catch (err) {
+      // Failures carry the reason plus the relevant (scrubbed) log lines: show them in full, not a toast.
+      const [head, ...rest] = String(err.message || err).split('\n\n');
+      const again = await modal({
+        title: `Couldn't connect to ${hidden ? r.ssid : ssid}`, wide: true, log: !!rest.length,
+        body: `<p style="margin-top:0">${esc(head)}</p>${rest.length ? `<pre class="out log-out">${esc(rest.join('\n\n'))}</pre>` : ''}`,
+        buttons: [{ label: 'Diagnostics', value: 'diag' }, { label: 'Close', cls: 'primary', value: null }],
+      });
+      if (again === 'diag') diag(device);
+    }
     if (out) toast(out.output || 'Connected');
     loadWifi(); loadNet(true);
   };
@@ -178,6 +191,20 @@ Settings.network = async (b) => {
     if (!r) return;
     if (r.hidden) return join('', '', dev, true);
     return join(r.net.ssid, r.net.security, dev);
+  };
+  // Scrubbed host diagnostics (rfkill, iw, nmcli, services, netplan, journal) to copy into a support chat.
+  const diag = async (dev) => {
+    const wifiDev = dev || ((net && net.interfaces) || []).filter((i) => i.type === 'wifi').map((i) => i.name)[0] || '';
+    let text = '';
+    await modal({
+      title: 'Wi-Fi diagnostics', wide: true, log: true,
+      body: `<p class="muted small" style="margin:0">Read-only checks on the host. Passwords and keys are removed, so this is safe to paste into a chat.</p><pre class="out log-out" data-dg>Collecting… (up to ~30s)</pre>`,
+      buttons: [{ label: 'Copy', handler: async () => { try { await navigator.clipboard.writeText(text); toast('Copied diagnostics'); } catch (_) { toast('Select the text and copy it', true); } return false; } }, { label: 'Close', cls: 'primary', value: null }],
+      onOpen: (m) => {
+        GET('/system/network/diagnostics' + (wifiDev ? '?device=' + encodeURIComponent(wifiDev) : '')).then((r) => { text = r.text; const p = $('[data-dg]', m); if (p) p.textContent = r.text; })
+          .catch((e) => { const p = $('[data-dg]', m); if (p) p.textContent = e.message; });
+      },
+    });
   };
   const ipSettings = async (dev) => {
     let cur = {};
@@ -232,6 +259,7 @@ Settings.network = async (b) => {
     if (e.target.closest('[data-nminstall]')) return installNm();
     if (e.target.closest('[data-setuplink]')) return setUplink();
     if (e.target.closest('[data-scan]')) return loadWifi(true);
+    if (e.target.closest('[data-diag]')) return diag();
     if (e.target.closest('[data-hidden]')) return join('', '', '', true);
     const ipc = e.target.closest('[data-ipcfg]'); if (ipc) return ipSettings(ipc.dataset.ipcfg);
     const j = e.target.closest('[data-join]'); if (j) return join(j.dataset.join, j.dataset.sec, j.dataset.wdev);

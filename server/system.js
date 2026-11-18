@@ -148,6 +148,14 @@ router.get('/wifi', wrap(async (req, res) => {
 
 // Body contains the Wi-Fi password: this path is in audit.js SECRET_PATH, and
 // netbackends scrubs it from any error text. Never log req.body here.
+// Scrubbed Wi-Fi/network diagnostics to paste into a support chat (admin only, read-only commands).
+router.get('/network/diagnostics', wrap(async (req, res) => {
+  const d = await netb.detect(true);
+  const out = await netb.diagnostics(d, String(req.query.device || '').replace(/[^\w.\-]/g, ''));
+  audit.write({ user: req.session.username, role: req.session.role, ip: req.socket.remoteAddress, action: 'network.diagnostics', ok: true, details: { device: out.device } });
+  res.json(out);
+}));
+
 router.post('/wifi/connect', wrap(async (req, res) => {
   const ssid = String(req.body.ssid || '');
   if (!ssid || Buffer.byteLength(ssid) > 32) throw bad('SSID required (max 32 bytes)');
@@ -195,6 +203,18 @@ router.post('/network/nm-install', wrap(async (req, res) => {
   const job = jobs.runHost('Install NetworkManager', req.session.username, 'sh', ['-c', netb.NM_INSTALL_SCRIPT, 'uiable-nm-install', d.install.pkg, mode, d.install.iwd ? '1' : '0'], {
     banner: `$ install NetworkManager (${d.install.pkg}, ${mode === 'all' ? 'manage all interfaces' : 'Wi-Fi only, existing config left unmanaged'})\n`,
     timeout: 30 * 60 * 1000,
+    // Hand the Wi-Fi to NetworkManager: netplan marks networkd-rendered devices unmanaged for NM,
+    // so drop Uiable's netplan Wi-Fi entries, re-apply, set the devices managed and the radio on.
+    beforeFinish: async (job, code, log) => {
+      if (code !== 0) return;
+      log('==> Handing Wi-Fi to NetworkManager\n');
+      netb.invalidate();
+      const d2 = await netb.detect(true);
+      if (!d2.nm.running) { log('NetworkManager is not running yet; open Settings → Network again in a moment.\n'); return; }
+      for (const l of await netb.nmAdopt(d2)) log(l + '\n');
+      const st = await host.run('nmcli', ['device', 'status'], { timeout: 10000 });
+      log((st.stdout || st.stderr || '') + '\n');
+    },
     onDone: () => netb.invalidate(),
   });
   audit.write({ user: req.session.username, role: req.session.role, ip: req.socket.remoteAddress, action: 'network.nm.install', ok: true, details: { kind: d.install.pkg, spec: mode, job: job.id } });

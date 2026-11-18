@@ -70,6 +70,21 @@ async function act(btn, fn, okMsg) {
 }
 
 const openModals = new Set();
+/* Lock the page behind dialogs (incl. iOS Safari, which ignores overflow:hidden on body alone):
+   pin the body at its scroll offset while any modal is open, restore it when the last one closes. */
+let scrollLocks = 0, lockedY = 0;
+function lockScroll() {
+  if (scrollLocks++ > 0) return;
+  lockedY = window.scrollY || document.documentElement.scrollTop || 0;
+  document.body.style.top = `-${lockedY}px`;
+  document.documentElement.classList.add('modal-open');
+}
+function unlockScroll() {
+  if (scrollLocks === 0 || --scrollLocks > 0) return;
+  document.documentElement.classList.remove('modal-open');
+  document.body.style.top = '';
+  window.scrollTo(0, lockedY);
+}
 function closeAllModals() { [...openModals].forEach((c) => c(null)); }
 function modal({ title, body = '', wide, full, log, buttons = [{ label: 'Close', value: null }], onOpen, dismissable = true }) {
   return new Promise((resolve) => {
@@ -78,8 +93,8 @@ function modal({ title, body = '', wide, full, log, buttons = [{ label: 'Close',
     bg.innerHTML = `<div class="modal ${wide ? 'wide' : ''} ${full ? 'wide full' : ''} ${log ? 'has-log' : ''}"><header><h2 class="grow ellipsis">${esc(title)}</h2><button class="icon" data-x>${ICON.x}</button></header><div class="body">${body}</div><footer>${buttons.map((b, i) => `<button data-i="${i}" class="${b.cls || ''}">${esc(b.label)}</button>`).join('')}</footer></div>`;
     const m = bg.firstChild;
     let cleanup = null;
-    const close = (v) => { if (!openModals.has(close)) return; openModals.delete(close); if (cleanup) cleanup(); bg.remove(); document.removeEventListener('keydown', onKey); resolve(v); };
-    openModals.add(close);
+    const close = (v) => { if (!openModals.has(close)) return; openModals.delete(close); if (cleanup) cleanup(); bg.remove(); unlockScroll(); document.removeEventListener('keydown', onKey); resolve(v); };
+    openModals.add(close); lockScroll();
     const onKey = (e) => { if (e.key === 'Escape' && dismissable) close(null); };
     document.addEventListener('keydown', onKey);
     bg.addEventListener('mousedown', (e) => { if (e.target === bg && dismissable) close(null); });
