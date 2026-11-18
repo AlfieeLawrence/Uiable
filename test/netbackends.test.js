@@ -868,3 +868,228 @@ test('diagnostics: one read-only script, output scrubbed, stale NM leftovers lis
   assert.ok(diag, 'ran the diagnostics script');
   for (const bad of [/netplan apply/, /nmcli .*connect/, /systemctl (start|stop|restart)/, /rm -/]) assert.doesNotMatch(diag[2], bad);
 });
+
+// ---- 1.2.7: cards without PMF (802.11w), e.g. Intel Centrino Advanced-N 6205 (iwldvm) — Alfie's host
+const ALFIE_IGTK_LOG = [
+  'xserver wpa_supplicant[48434]: wlp3s0: Associated with b8:ff:b3:06:38:6f',
+  'xserver wpa_supplicant[48434]: wlp3s0: CTRL-EVENT-SUBNET-STATUS-UPDATE status=0',
+  'xserver wpa_supplicant[48434]: nl80211: kernel reports: key setting validation failed',
+  'xserver wpa_supplicant[48434]: wlp3s0: WPA: Failed to configure IGTK to the driver',
+  'xserver wpa_supplicant[48434]: wlp3s0: RSN: Failed to configure IGTK',
+  'xserver wpa_supplicant[48434]: wlp3s0: CTRL-EVENT-DISCONNECTED bssid=b8:ff:b3:06:38:6f reason=1 locally_generated=1',
+  'xserver wpa_supplicant[48434]: wlp3s0: CTRL-EVENT-SSID-TEMP-DISABLED id=0 ssid="HomeWifi" auth_failures=3 duration=30 reason=CONN_FAILED',
+].join('\n') + '\n';
+const IW_PHY_6205 = 'driver:iwlwifi\nmod:iwldvm\niw:1\n### ciphers\n\tSupported Ciphers:\n\t\t* WEP40 (00-0f-ac:1)\n\t\t* WEP104 (00-0f-ac:5)\n\t\t* TKIP (00-0f-ac:2)\n\t\t* CCMP-128 (00-0f-ac:4)\n\tAvailable Antennas: TX 0 RX 0\n';
+const IW_PHY_AX = 'driver:iwlwifi\niw:1\n### ciphers\n\tSupported Ciphers:\n\t\t* CCMP-128 (00-0f-ac:4)\n\t\t* CMAC (00-0f-ac:6)\n\t\t* GMAC-128 (00-0f-ac:11)\n\tAvailable Antennas: TX 0 RX 0\n';
+
+test('parsePmfProbe: iw phy ciphers, iwldvm fallback, wpa_supplicant group_mgmt', () => {
+  assert.equal(nb.parsePmfProbe(IW_PHY_6205, '').pmf, false);
+  assert.match(nb.parsePmfProbe(IW_PHY_6205, '').source, /00-0f-ac:6/);
+  assert.equal(nb.parsePmfProbe(IW_PHY_AX, '').pmf, true);
+  assert.equal(nb.parsePmfProbe('driver:iwlwifi\nmod:iwldvm\n', '').pmf, false, 'no iw on host: iwldvm module is enough');
+  assert.equal(nb.parsePmfProbe('driver:ath9k\n', 'AES-128-CMAC BIP-GMAC-128\n').pmf, true);
+  assert.equal(nb.parsePmfProbe('driver:ath9k\n', 'OK\n').pmf, null, 'ambiguous output is not "no PMF"');
+  assert.equal(nb.parsePmfProbe('', '').pmf, null);
+});
+
+test('own supplicant conf: hex SSID + PSK, WPA-PSK only, PMF off; unit; ini edit', () => {
+  const psk = nb.wpaPsk('Home "Wifi"', 'pass#1 word');
+  const c = nb.buildOwnWpaConf({ ssid: 'Home "Wifi"', psk });
+  assert.match(c, /^pmf=0$/m); assert.match(c, /^\tieee80211w=0$/m); assert.match(c, /^\tkey_mgmt=WPA-PSK$/m);
+  assert.match(c, new RegExp(`^\\tpsk=${psk}$`, 'm')); assert.ok(!c.includes('pass#1'));
+  assert.equal(nb.ownWpaSsid(c), 'Home "Wifi"');
+  assert.match(nb.buildOwnWpaConf({ ssid: 'Cafe', open: true, hidden: true }), /key_mgmt=NONE[\s\S]*ieee80211w=0/);
+  assert.match(nb.OWN_WPA_UNIT, /ExecStart=\/usr\/sbin\/wpa_supplicant -c \/etc\/wpa_supplicant\/uiable-%I\.conf -i%I/);
+  assert.match(nb.OWN_WPA_UNIT, /WantedBy=multi-user\.target/);
+  assert.equal(nb.setIniKey('', 'General', 'ManagementFrameProtection', '0'), '[General]\nManagementFrameProtection=0\n');
+  assert.equal(nb.setIniKey('[General]\nEnableNetworkConfiguration=true\n\n[Scan]\nX=1\n', 'General', 'ManagementFrameProtection', '0'), '[General]\nEnableNetworkConfiguration=true\nManagementFrameProtection=0\n\n[Scan]\nX=1\n');
+  assert.equal(nb.setIniKey('[General]\nManagementFrameProtection=1\n', 'General', 'ManagementFrameProtection', '0'), '[General]\nManagementFrameProtection=0\n');
+  assert.match(nb.buildNetworkdUnit({ device: 'wlp3s0', mode: 'dhcp', wifi: true }), /RequiredForOnline=no/);
+});
+
+test('classifier: "Failed to configure IGTK" is a card/driver without PMF, not a wrong password', () => {
+  const w = nb.classifyWifiFailure({ log: ALFIE_IGTK_LOG, security: 'WPA2/WPA3 transition', device: 'wlp3s0', associated: false });
+  assert.equal(w.code, 'no-pmf');
+  assert.match(w.message, /802\.11w/); assert.match(w.message, /Failed to configure IGTK/);
+});
+
+// Alfie's real host: no NM, no iw/rfkill, netplan + networkd, a D-Bus wpa_supplicant running (-> wifi=wpa_supplicant, config=netplan)
+const ALFIE_NOIW = 'bin:netplan\nbin:networkctl\nbin:ip\nbin:journalctl\nbin:resolvectl\nbin:wpa_cli\nbin:wpa_supplicant\nbin:apt-get\nunit:systemd-networkd:active\nproc:wpa_supplicant\nproc:systemd-networkd\ndir:netplan\nwifi:wlp3s0\n';
+function alfieHost(root, { probe = 'driver:iwlwifi\nmod:iwldvm\n', ownWorks = true, flags = '[WPA2-PSK+SAE-CCMP][ESS]' } = {}) {
+  fs.mkdirSync(path.join(root, 'etc/netplan'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'etc/os-release'), 'ID=ubuntu\nPRETTY_NAME="Ubuntu 26.04.1 LTS"\n');
+  const st = { ownUp: false, netplanWifi: false };
+  const h = fakeHost([
+    [/^nmcli /, { code: 127, stderr: 'nsenter: failed to execute nmcli: No such file or directory' }],
+    [/^sh -c for b in/, { stdout: ALFIE_NOIW }],
+    [/^sh -c for r in/, { stdout: 'phy0 wlan 0 0\n' }],
+    [/^sh -c dev=/, { stdout: probe }],
+    [/^sh -c pgrep/, () => ({ stdout: '1302 /usr/sbin/wpa_supplicant -u -s -O DIR=/run/wpa_supplicant GROUP=netdev\n' + (st.netplanWifi ? '48434 /sbin/wpa_supplicant -c /run/netplan/wpa-wlp3s0.conf -iwlp3s0 -Dnl80211,wext\n' : '') })],
+    [/get_capability/, { stdout: '\n' }],
+    [/scan_results/, { stdout: `bssid / frequency / signal level / flags / ssid\nb8:ff:b3:06:38:5f\t5560\t-55\t${flags}\tHomeWifi\n` }],
+    [/wpa_cli -i wlp3s0 status/, () => ({ stdout: st.ownUp && ownWorks ? 'wpa_state=COMPLETED\nssid=HomeWifi\nbssid=b8:ff:b3:06:38:5f\nfreq=5560\n' : 'wpa_state=SCANNING\n' })],
+    [/signal_poll/, { stdout: 'RSSI=-55\n' }],
+    [/^wpa_cli /, { stdout: 'OK\n' }],
+    [/^netplan apply/, () => { const f = path.join(root, 'etc/netplan/90-uiable.yaml'); st.netplanWifi = fs.existsSync(f) && /wifis/.test(fs.readFileSync(f, 'utf8')); return {}; }],
+    [/^netplan get/, { code: 0, stdout: 'null\n' }],
+    [/^netplan /, {}],
+    [/^systemctl is-enabled/, { code: 1, stdout: 'disabled\n' }],
+    [/^systemctl restart uiable-wpa@wlp3s0/, () => { st.ownUp = true; return {}; }],
+    [/^systemctl (stop|disable).*uiable-wpa/, () => { st.ownUp = false; return {}; }],
+    [/^systemctl /, {}],
+    [/^networkctl /, {}],
+    [/^journalctl /, () => ({ stdout: st.netplanWifi || (st.ownUp && !ownWorks) ? ALFIE_IGTK_LOG : '' })],
+    [/^ip -j -4 addr show dev wlp3s0/, () => json([ipAddr('wlp3s0', st.ownUp && ownWorks ? { v4: '192.168.1.201/24' } : {})])],
+    [/^ip /, {}],
+  ], root);
+  return Object.assign(h, { st });
+}
+
+test('Alfie: no-PMF card pre-detected (iwldvm, no iw) -> Uiable-managed wpa_supplicant, PMF off, persisted', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'root-'));
+  fs.mkdirSync(path.join(root, 'etc/netplan'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'etc/netplan/90-uiable.yaml'), yaml.dump({ network: { version: 2, wifis: { wlp3s0: { dhcp4: true, 'access-points': { HomeWifi: { auth: { 'key-management': 'psk', password: 'x'.repeat(64) } } } } } } }));
+  const { netb, calls, st } = alfieHost(root);
+  const d = await netb.detect(true);
+  assert.equal(d.backends.wifi, 'wpa_supplicant'); assert.equal(d.backends.config, 'netplan');
+  const out = await netb.wifiConnect(d, { ssid: 'HomeWifi', password: 'correct horse 1', device: 'wlp3s0' });
+  assert.match(out.output, /PMF \(802\.11w\) off/); assert.match(out.output, /uiable-wpa@wlp3s0/); assert.match(out.output, /Install NetworkManager/);
+  assert.equal(out.pmf, false); assert.equal(out.ip, '192.168.1.201/24');
+  const conf = fs.readFileSync(path.join(root, 'etc/wpa_supplicant/uiable-wlp3s0.conf'), 'utf8');
+  assert.match(conf, /ieee80211w=0/); assert.match(conf, /key_mgmt=WPA-PSK/); assert.ok(!conf.includes('correct horse 1'));
+  assert.equal(fs.statSync(path.join(root, 'etc/wpa_supplicant/uiable-wlp3s0.conf')).mode & 0o777, 0o600);
+  const net = path.join(root, 'etc/systemd/network/10-uiable-wlp3s0.network');
+  assert.match(fs.readFileSync(net, 'utf8'), /Name=wlp3s0[\s\S]*DHCP=yes[\s\S]*RequiredForOnline=no/);
+  assert.equal(fs.statSync(net).mode & 0o777, 0o644, 'networkd must be able to read it');
+  assert.match(fs.readFileSync(net + '.d/90-uiable-uplink.conf', 'utf8'), /RouteMetric=600/);
+  assert.ok(fs.existsSync(path.join(root, 'etc/systemd/system/uiable-wpa@.service')));
+  const y = yaml.load(fs.readFileSync(path.join(root, 'etc/netplan/90-uiable.yaml'), 'utf8'));
+  assert.equal((y.network.wifis || {}).wlp3s0, undefined, 'netplan no longer starts a second supplicant');
+  assert.equal(st.netplanWifi, false);
+  const k = calls.map((c) => c.join(' '));
+  assert.ok(k.includes('systemctl enable uiable-wpa@wlp3s0.service'));
+  assert.ok(k.indexOf('systemctl restart uiable-wpa@wlp3s0.service') > k.lastIndexOf('netplan apply'), 'own supplicant starts after netplan dropped its one');
+  assert.ok(!JSON.stringify(calls).includes('correct horse 1'));
+  // remembered + follow-ups use the networkd/own-supplicant path
+  assert.equal((await netb.savedWifi(d, 'wlp3s0', {})).kind, 'uiable-wpa');
+  assert.equal((await netb.getIpConfig(d, 'wlp3s0')).backend, 'systemd-networkd');
+  assert.equal((await netb.getIpConfig(d, 'wlp3s0')).managed, true);
+});
+
+test('Alfie: undetected no-PMF -> IGTK failure on netplan attempt -> remembered, retried with PMF off', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'root-'));
+  const { netb, calls } = alfieHost(root, { probe: 'driver:iwlwifi\n' });
+  const d = await netb.detect(true);
+  assert.equal((await netb.pmfCapability(d, 'wlp3s0')).pmf, null);
+  const out = await netb.wifiConnect(d, { ssid: 'HomeWifi', password: 'correct horse 1', device: 'wlp3s0' });
+  assert.equal(out.pmf, false);
+  const k = calls.map((c) => c.join(' '));
+  assert.ok(k.filter((x) => x === 'netplan apply').length >= 2, 'netplan WPA2 attempt applied and rolled back');
+  assert.ok(!k.some((x) => /^netplan/.test(x) && /sae/i.test(x)));
+  assert.ok(fs.existsSync(path.join(root, 'etc/wpa_supplicant/uiable-wlp3s0.conf')));
+  const cap = await netb.pmfCapability(d, 'wlp3s0');
+  assert.equal(cap.pmf, false); assert.match(cap.source, /remembered.*IGTK/);
+});
+
+test('PMF-off attempt fails too -> everything rolled back, router hint shown', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'root-'));
+  const { netb, calls } = alfieHost(root, { ownWorks: false });
+  const d = await netb.detect(true);
+  await assert.rejects(netb.wifiConnect(d, { ssid: 'HomeWifi', password: 'correct horse 1', device: 'wlp3s0' }), (e) => {
+    assert.equal(e.code, 'no-pmf'); assert.match(e.message, /PMF optional/); assert.match(e.message, /rolled back/);
+    return true;
+  });
+  assert.equal(fs.existsSync(path.join(root, 'etc/wpa_supplicant/uiable-wlp3s0.conf')), false);
+  assert.equal(fs.existsSync(path.join(root, 'etc/systemd/network/10-uiable-wlp3s0.network')), false);
+  assert.equal(fs.existsSync(path.join(root, 'etc/systemd/system/uiable-wpa@.service')), false);
+  assert.ok(calls.some((c) => c.join(' ') === 'systemctl disable uiable-wpa@wlp3s0.service'));
+});
+
+test('WPA3-only network on a card without PMF: clear message, nothing changed', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'root-'));
+  const { netb, calls } = alfieHost(root, { flags: '[RSN-SAE-CCMP][ESS]' });
+  const d = await netb.detect(true);
+  await assert.rejects(netb.wifiConnect(d, { ssid: 'HomeWifi', password: 'correct horse 1', device: 'wlp3s0' }), (e) => e.code === 'no-pmf' && /WPA3-only/.test(e.message) && /WPA2\/WPA3 mixed/.test(e.message) && /newer Wi-Fi card/.test(e.message));
+  assert.ok(!calls.some((c) => c[0] === 'netplan' || (c[0] === 'systemctl' && c[1] !== 'is-active')));
+});
+
+test('wpa_cli (no netplan) on a no-PMF card: WPA-PSK + ieee80211w 0', async () => {
+  const { netb, calls } = fakeHost([
+    [/^nmcli /, { code: 127 }],
+    [/^sh -c for b in/, { stdout: 'bin:wpa_cli\nbin:ip\nproc:wpa_supplicant\nwifi:wlan0\n' }],
+    [/^sh -c for r in/, { stdout: '' }],
+    [/^sh -c dev=/, { stdout: IW_PHY_6205 }],
+    [/scan_results/, { stdout: 'bssid / frequency / signal level / flags / ssid\naa:bb:cc:dd:ee:01\t2437\t-45\t[WPA2-PSK+SAE-CCMP][ESS]\tHome\n' }],
+    [/add_network/, { stdout: '0\n' }],
+    [/wpa_cli -i wlan0 status/, { stdout: 'wpa_state=COMPLETED\nssid=Home\n' }],
+    [/^wpa_cli /, { stdout: 'OK\n' }],
+    [/^ip -j -4 addr show dev wlan0/, json([ipAddr('wlan0', { v4: '10.0.0.9/24' })])],
+    [/^ip /, {}],
+  ], os.tmpdir());
+  await netb.wifiConnect(await netb.detect(true), { ssid: 'Home', password: 'pass phrase 1', device: 'wlan0' });
+  const set = (k) => calls.filter((c) => c[3] === 'set_network' && c[5] === k).map((c) => c[6]);
+  assert.deepEqual(set('key_mgmt'), ['WPA-PSK']); assert.deepEqual(set('ieee80211w'), ['0']); assert.deepEqual(set('psk'), [nb.wpaPsk('Home', 'pass phrase 1')]);
+});
+
+test('NetworkManager: left to negotiate PMF itself; on IGTK failure retries with wifi-sec.pmf 1 + wpa-psk', async () => {
+  let pmfProfile = false;
+  const { netb, calls } = fakeHost([
+    [/^nmcli -t -f RUNNING general/, { stdout: 'running\n' }],
+    [/^sh -c for b in/, { stdout: NM_PROBE + 'bin:journalctl\n' }],
+    [/^sh -c for r in/, { stdout: '' }],
+    [/^sh -c dev=/, { stdout: 'driver:iwlwifi\nmod:iwldvm\n' }],
+    [/^sh -c pgrep/, { stdout: '' }],
+    [/^nmcli -t -f DEVICE,TYPE,STATE,CONNECTION device/, { stdout: 'wlp3s0:wifi:disconnected:--\n' }],
+    [/^nmcli -t -f IN-USE,SSID/, { stdout: ':HomeWifi:B8\\:FF:80:WPA2 WPA3:112:wlp3s0\n' }],
+    [/^nmcli --wait 45 device wifi connect/, { code: 4, stderr: 'Error: Connection activation failed: (7) Secrets were required, but not provided.' }],
+    [/^nmcli connection add/, () => { pmfProfile = true; return {}; }],
+    [/^nmcli --wait 45 connection up/, {}],
+    [/^nmcli -t -f ACTIVE,SSID/, () => ({ stdout: pmfProfile ? 'yes:HomeWifi:80:112:wlp3s0\n' : '' })],
+    [/^nmcli /, {}],
+    [/^journalctl /, () => ({ stdout: pmfProfile ? '' : ALFIE_IGTK_LOG })],
+    [/^ip -j -4 addr show dev wlp3s0/, () => json([ipAddr('wlp3s0', pmfProfile ? { v4: '192.168.1.201/24' } : {})])],
+    [/^ip /, {}],
+  ], os.tmpdir());
+  const d = await netb.detect(true);
+  const out = await netb.wifiConnect(d, { ssid: 'HomeWifi', password: 'correct horse 1', device: 'wlp3s0' });
+  const k = calls.map((c) => c.join(' '));
+  assert.ok(k.findIndex((x) => x.startsWith('nmcli --wait 45 device wifi connect')) < k.findIndex((x) => x.startsWith('nmcli connection add')), 'NM default first');
+  assert.ok(k.some((x) => /connection add .*wifi-sec\.key-mgmt wpa-psk .*wifi-sec\.pmf 1/.test(x)));
+  assert.equal(out.pmf, false);
+});
+
+test('iwd on a no-PMF card: ManagementFrameProtection=0 in main.conf', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'root-'));
+  const { netb, calls } = fakeHost([
+    [/^nmcli /, { code: 127 }],
+    [/^sh -c for b in/, { stdout: 'bin:iwctl\nbin:ip\nunit:iwd:active\nwifi:wlan0\n' }],
+    [/^sh -c for r in/, { stdout: '' }],
+    [/^sh -c dev=/, { stdout: IW_PHY_6205 }],
+    [/^iwctl station wlan0 get-networks/, { stdout: '  Network name   Security  Signal\n  Home           psk       ****\n' }],
+    [/^iwctl station wlan0 show/, { stdout: '  State   connected\n  Connected network   Home\n' }],
+    [/^iwctl /, {}],
+    [/^systemctl /, {}],
+    [/^ip -j -4 addr show dev wlan0/, json([ipAddr('wlan0', { v4: '10.0.0.9/24' })])],
+    [/^ip /, {}],
+  ], root);
+  await netb.wifiConnect(await netb.detect(true), { ssid: 'Home', password: 'pass phrase 1', device: 'wlan0' });
+  assert.match(fs.readFileSync(path.join(root, 'etc/iwd/main.conf'), 'utf8'), /\[General\]\nManagementFrameProtection=0/);
+  assert.ok(calls.some((c) => c.join(' ') === 'systemctl restart iwd'));
+});
+
+test('nmAdopt retires uiable-wpa@dev; diagnostics shows PMF + install hint', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'root-'));
+  const a = alfieHost(root);
+  const d = await a.netb.detect(true);
+  await a.netb.wifiConnect(d, { ssid: 'HomeWifi', password: 'correct horse 1', device: 'wlp3s0' });
+  const dg = await a.netb.diagnostics(d, 'wlp3s0');
+  assert.match(dg.text, /iw and rfkill are not installed.*sudo apt install iw rfkill/);
+  assert.match(dg.text, /PMF \(802\.11w\) support on wlp3s0: NO/);
+  assert.match(dg.text, /Recommended: Install NetworkManager/);
+  assert.match(dg.text, /uiable-wpa@wlp3s0/);
+  d.caps.bins.add('nmcli');
+  const log = await a.netb.nmAdopt(d, ['wlp3s0']);
+  assert.match(log.join('\n'), /Stopped Uiable's own wpa_supplicant/);
+  assert.equal(fs.existsSync(path.join(root, 'etc/wpa_supplicant/uiable-wlp3s0.conf')), false);
+  assert.ok(a.calls.some((c) => c.join(' ') === 'systemctl disable --now uiable-wpa@wlp3s0.service'));
+});

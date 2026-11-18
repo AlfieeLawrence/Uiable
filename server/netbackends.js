@@ -13,7 +13,8 @@
 const crypto = require('crypto');
 const net = require('net');
 const path = require('path');
-const fsp = require('fs').promises;
+const fs = require('fs');
+const fsp = fs.promises;
 const yaml = require('js-yaml');
 
 // ---------------------------------------------------------------- pure helpers
@@ -238,6 +239,8 @@ function buildNetworkdUnit(cfg) {
     if (cfg.gateway) lines.push(`Gateway=${cfg.gateway}`);
     (cfg.dns || []).forEach((d) => lines.push(`DNS=${d}`));
   }
+  // Wi-Fi shouldn't hold up boot (systemd-networkd-wait-online) when the cable is the main link.
+  if (cfg.wifi) lines.push('', '[Link]', 'RequiredForOnline=no');
   return lines.join('\n') + '\n';
 }
 
@@ -446,6 +449,7 @@ function parseRfkill(out) {
  * Turn a failed Wi-Fi attempt into one clear reason.
  * ctx: { log, rfkill:[...], associated, ip, supplicantMissing, regdom, nmError, backend }
  */
+const PMF_FAIL_RE = /Failed to configure IGTK|key setting validation failed|Failed to set IGTK|BIP.*not supported/i;
 function classifyWifiFailure(ctx) {
   const log = String(ctx.log || '') + '\n' + String(ctx.nmError || '');
   const wl = (ctx.rfkill || []).filter((r) => r.type === 'wlan');
@@ -455,6 +459,8 @@ function classifyWifiFailure(ctx) {
   if (wl.some((r) => r.hard)) return { code: 'rfkill-hard', message: 'Wi-Fi is switched off in hardware (rfkill hard block): check the laptop Wi-Fi switch/Fn key or the BIOS setting.' };
   if (wl.some((r) => r.soft)) return { code: 'rfkill-soft', message: 'Wi-Fi is blocked by rfkill (soft block) and could not be unblocked. Run `rfkill unblock wifi` on the host.' };
   if (ctx.supplicantMissing) return { code: 'no-supplicant', message: 'netplan needs wpa_supplicant to join Wi-Fi, but it is not installed on the host. Install it (`sudo apt install wpasupplicant`) or use Install NetworkManager.' };
+  // The driver refused the management-frame key (IGTK): the card/driver can't do PMF (802.11w) but the AP offers it.
+  if (PMF_FAIL_RE.test(log)) return { code: 'no-pmf', message: withLog('This Wi-Fi card/driver does not support protected management frames (PMF, 802.11w): the driver refused the IGTK key ("Failed to configure IGTK") right after associating.') };
   // Only claim "wrong password" on explicit evidence from the supplicant / NetworkManager / iwd.
   // A bare 4-way handshake timeout (reason=15), auth_failures, or "Authentication failed" can equally
   // come from PMF/WPA3 mismatches, two supplicants fighting over the interface, band or driver issues.
@@ -500,6 +506,92 @@ function scrubDiagnostics(text, secrets) {
   t = t.replace(/^(\s*(?:["']?(?:password|psk|sae_password|passphrase|wpa-psk|wep-key\d?|private-key-password|psk-flags)["']?)\s*[:=]\s*).+$/gim, '$1••••');
   t = t.replace(/\b[0-9a-f]{64}\b/gi, '••••(hex key)');
   return t;
+}
+
+// ---------------------------------------------------------------- PMF (802.11w) capability + Uiable-managed wpa_supplicant (pure)
+/**
+ * Does the Wi-Fi card/driver support PMF? Input: output of PMF_PROBE (iw phy ciphers, loaded driver modules)
+ * and `wpa_cli get_capability group_mgmt`. BIP-CMAC-128 (cipher suite 00-0f-ac:6) is required for PMF.
+ * Returns { pmf: true | false | null (unknown), source, driver }.
+ */
+function parsePmfProbe(out, groupMgmt) {
+  const t = String(out || '');
+  const driver = ((t.match(/^driver:(\S*)/m) || [])[1]) || '';
+  const iwSec = t.split(/^### /m).find((x) => x.startsWith('ciphers'));
+  if (/^iw:1/m.test(t) && iwSec && /\(00-0f-ac:\d+\)|\bCCMP\b/i.test(iwSec)) {
+    const ok = /00-0f-ac:6|BIP-CMAC-128|\bCMAC\b|AES-128-CMAC/i.test(iwSec);
+    return { pmf: ok, source: ok ? 'iw phy: BIP-CMAC-128 (00-0f-ac:6) supported' : 'iw phy: no BIP-CMAC-128 (00-0f-ac:6) cipher', driver };
+  }
+  // wpa_supplicant only lists group-management ciphers the driver has; an empty list is ambiguous (older builds).
+  const gm = String(groupMgmt || '').trim();
+  if (/AES-128-CMAC|BIP-CMAC-128/i.test(gm)) return { pmf: true, source: `wpa_supplicant group_mgmt: ${gm.split('\n')[0].slice(0, 80)}`, driver };
+  // Intel iwldvm cards (Centrino Wireless-N / Advanced-N 1000-6000 series, 100/105/130/135/2200/2230) never do PMF.
+  if (/^mod:iwldvm/m.test(t)) return { pmf: false, source: 'iwldvm driver (older Intel Centrino card) has no PMF support', driver: driver || 'iwlwifi' };
+  return { pmf: null, source: 'unknown (install `iw` to check)', driver };
+}
+const PMF_PROBE = [
+  'dev="$1"; phy=$(cat /sys/class/net/"$dev"/phy80211/name 2>/dev/null)',
+  'echo "driver:$(basename "$(readlink /sys/class/net/"$dev"/device/driver 2>/dev/null)" 2>/dev/null)"',
+  '[ -d /sys/module/iwldvm ] && echo "mod:iwldvm"',
+  'if command -v iw >/dev/null 2>&1; then echo "iw:1"; echo "### ciphers"; iw phy "$phy" info 2>/dev/null | sed -n "/Supported Ciphers/,/Available Antennas\\|Supported interface modes/p"; fi',
+  'true',
+].join('\n');
+
+/** wpa_supplicant config for Uiable's own per-device supplicant (PMF off: for cards that can't do 802.11w). */
+function buildOwnWpaConf({ ssid, psk, hidden, open }) {
+  const lines = [
+    '# Managed by Uiable (Settings > Network > Wi-Fi). This Wi-Fi card cannot do PMF (802.11w), so PMF is off.',
+    'ctrl_interface=/run/wpa_supplicant', 'update_config=0', 'pmf=0', '', 'network={',
+    `\tssid=${Buffer.from(String(ssid), 'utf8').toString('hex')}`,
+  ];
+  if (hidden) lines.push('\tscan_ssid=1');
+  if (open) lines.push('\tkey_mgmt=NONE');
+  else lines.push('\tkey_mgmt=WPA-PSK', `\tpsk=${psk}`);
+  lines.push('\tieee80211w=0', '}', '');
+  return lines.join('\n');
+}
+/** SSID from a Uiable-written conf (hex or quoted). */
+function ownWpaSsid(text) {
+  const m = String(text || '').match(/^\s*ssid=(.+)$/m);
+  if (!m) return '';
+  const v = m[1].trim();
+  if (/^"/.test(v)) return v.replace(/^"|"$/g, '');
+  return /^[0-9a-f]+$/i.test(v) ? Buffer.from(v, 'hex').toString('utf8') : v;
+}
+const OWN_WPA_UNIT = `# Managed by Uiable: wpa_supplicant for Wi-Fi cards that need settings netplan can't express (PMF off).
+[Unit]
+Description=Uiable WPA supplicant for %I
+Requires=sys-subsystem-net-devices-%i.device
+After=sys-subsystem-net-devices-%i.device
+Before=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/wpa_supplicant -c /etc/wpa_supplicant/uiable-%I.conf -i%I -Dnl80211,wext
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+`;
+
+/** Set key=value inside [section] of an ini text (adds the section/key when missing). */
+function setIniKey(text, section, key, value) {
+  const lines = String(text || '').split('\n');
+  if (lines.length && lines[lines.length - 1] === '') lines.pop();
+  let start = lines.findIndex((l) => l.trim() === `[${section}]`);
+  if (start < 0) { if (lines.length) lines.push(''); lines.push(`[${section}]`, `${key}=${value}`); return lines.join('\n') + '\n'; }
+  let end = lines.findIndex((l, i) => i > start && /^\s*\[/.test(l)); if (end < 0) end = lines.length;
+  const k = lines.findIndex((l, i) => i > start && i < end && new RegExp(`^\\s*${key}\\s*=`).test(l));
+  if (k >= 0) lines[k] = `${key}=${value}`;
+  else { let at = end; while (at > start + 1 && lines[at - 1].trim() === '') at--; lines.splice(at, 0, `${key}=${value}`); }
+  return lines.join('\n') + '\n';
+}
+
+function wpa3NoPmfMessage(ssid, cap) {
+  return `${ssid} is WPA3-only, and WPA3 always needs protected management frames (PMF, 802.11w), which this Wi-Fi card/driver${cap && cap.driver ? ` (${cap.driver})` : ''} does not support. ` +
+    'Set the router\'s Wi-Fi security to "WPA2/WPA3 mixed" (transition) with PMF "optional"/"capable" (or WPA2-only), or use a newer Wi-Fi card / USB adapter.';
 }
 
 // ---------------------------------------------------------------- uplink preference (pure)
@@ -756,11 +848,15 @@ function create({ run, root, dataDir, opts = {} }) {
   // ---- host files with snapshot/restore (for rollback)
   async function snapshotFiles(rels) {
     const snap = [];
-    for (const rel of rels) snap.push({ rel, text: await fsp.readFile(hostFile(rel), 'utf8').catch(() => null) });
+    for (const rel of rels) {
+      const text = await fsp.readFile(hostFile(rel), 'utf8').catch(() => null);
+      const mode = text == null ? null : ((await fsp.stat(hostFile(rel)).catch(() => null)) || { mode: 0o600 }).mode & 0o777;
+      snap.push({ rel, text, mode });
+    }
     return async () => {
       for (const s of snap) {
         if (s.text == null) await fsp.unlink(hostFile(s.rel)).catch(() => {});
-        else { await fsp.mkdir(path.dirname(hostFile(s.rel)), { recursive: true }); await fsp.writeFile(hostFile(s.rel), s.text, { mode: 0o600 }); }
+        else { await fsp.mkdir(path.dirname(hostFile(s.rel)), { recursive: true }); await fsp.writeFile(hostFile(s.rel), s.text, { mode: s.mode }); await fsp.chmod(hostFile(s.rel), s.mode).catch(() => {}); }
       }
     };
   }
@@ -856,7 +952,7 @@ function create({ run, root, dataDir, opts = {} }) {
       const wifi = type === 'wifi' ? await wifiLink(d, i.name, nmMap).catch(() => ({ connected: false })) : null;
       const st = ifaceStatus(i, type, wifi);
       const gw = routes.filter((r) => r.dev === i.name);
-      const managedBy = type === 'loopback' || type === 'virtual' ? null : (d.nm.running && nmManages(nmMap, i.name)) ? 'networkmanager' : (d.backends.fallbackConfig || d.backends.config || null);
+      const managedBy = type === 'loopback' || type === 'virtual' ? null : (d.nm.running && nmManages(nmMap, i.name)) ? 'networkmanager' : ownWpaActive(i.name) ? 'systemd-networkd' : (d.backends.fallbackConfig || d.backends.config || null);
       interfaces.push({
         name: i.name, type, state: st.state, label: st.label, canLink: st.canLink && !!d.backends.link,
         canConfig: !!managedBy && type !== 'virtual' && type !== 'loopback',
@@ -940,7 +1036,7 @@ function create({ run, root, dataDir, opts = {} }) {
   }
   async function wifiLog(d, dev, since) {
     if (!d.caps.bins.has('journalctl')) return '';
-    const units = [`netplan-wpa-${dev}.service`, 'wpa_supplicant.service', `wpa_supplicant@${dev}.service`, 'iwd.service', 'systemd-networkd.service', 'NetworkManager.service'];
+    const units = [`netplan-wpa-${dev}.service`, `uiable-wpa@${dev}.service`, 'wpa_supplicant.service', `wpa_supplicant@${dev}.service`, 'iwd.service', 'systemd-networkd.service', 'NetworkManager.service'];
     const r = await run('journalctl', ['--no-pager', '-o', 'short-unix', '-n', '200', '--since', `@${Math.floor(since / 1000)}`, ...units.flatMap((u) => ['-u', u])], { timeout: 10000 });
     return filterJournalSince(r.stdout || '', since);
   }
@@ -999,6 +1095,7 @@ function create({ run, root, dataDir, opts = {} }) {
       log.push(`Removed ${drop.join(', ')} from ${'/' + NETPLAN_OWN} so NetworkManager can manage it.`);
       if (d.caps.bins.has('netplan')) { await run('netplan', ['generate'], { timeout: 30000 }); await run('netplan', ['apply'], { timeout: 90000 }); }
     }
+    for (const x of list) if (ownWpaActive(x)) { await ownWpaRemove(x); log.push(`Stopped Uiable's own wpa_supplicant (uiable-wpa@${x}) so NetworkManager is the only Wi-Fi manager.`); }
     await run('nmcli', ['radio', 'wifi', 'on'], { timeout: 10000 });
     for (const x of list) {
       const r = await run('nmcli', ['device', 'set', x, 'managed', 'yes'], { timeout: 10000 });
@@ -1026,6 +1123,120 @@ function create({ run, root, dataDir, opts = {} }) {
     try { const n = (await scan(d, false, dev)).find((x) => x.ssid === ssid); return n ? (n.security || 'open') : ''; } catch (_) { return ''; }
   }
 
+  // ---- PMF (802.11w) capability per device, remembered once a card proves it can't do it
+  const pmfCache = new Map();
+  async function pmfCapability(d, dev) {
+    if (pmfCache.has(dev)) return pmfCache.get(dev);
+    const prefs = await loadPrefs();
+    const known = (prefs.noPmf || {})[dev];
+    const [probe, gm] = await Promise.all([
+      run('sh', ['-c', PMF_PROBE, 'uiable-pmf', dev], { timeout: 8000 }).catch(() => ({ stdout: '' })),
+      d.caps.bins.has('wpa_cli') ? run('wpa_cli', ['-i', dev, 'get_capability', 'group_mgmt'], { timeout: 5000 }).catch(() => ({ code: 1, stdout: '' })) : Promise.resolve({ code: 1, stdout: '' }),
+    ]);
+    let cap = parsePmfProbe(probe.stdout, gm.code === 0 ? gm.stdout : '');
+    if (known && cap.pmf !== false) cap = Object.assign({}, cap, { pmf: false, source: `remembered: ${known.source || 'driver refused the IGTK key'}` });
+    pmfCache.set(dev, cap);
+    return cap;
+  }
+  async function rememberNoPmf(dev, source) {
+    const prefs = await loadPrefs();
+    prefs.noPmf = prefs.noPmf || {};
+    prefs.noPmf[dev] = { source, at: new Date().toISOString() };
+    await savePrefs(prefs);
+    pmfCache.delete(dev);
+  }
+
+  // ---- Uiable-managed wpa_supplicant (uiable-wpa@<dev>) for cards netplan can't configure (PMF off)
+  const OWN_UNIT_REL = 'etc/systemd/system/uiable-wpa@.service';
+  const ownConfRel = (dev) => `etc/wpa_supplicant/uiable-${dev}.conf`;
+  const ownNetRel = (dev) => `etc/systemd/network/10-uiable-${dev}.network`;
+  const ownUplinkRel = (dev) => `${ownNetRel(dev)}.d/90-uiable-uplink.conf`;
+  const ownWpaActive = (dev) => validDev(dev) && fs.existsSync(hostFile(ownConfRel(dev)));
+  const writeHost = async (rel, text, mode) => { await fsp.mkdir(path.dirname(hostFile(rel)), { recursive: true }); await fsp.writeFile(hostFile(rel), text, { mode }); await fsp.chmod(hostFile(rel), mode).catch(() => {}); };
+  const sysd = (args, t = 30000) => run('systemctl', args, { timeout: t });
+  async function networkdReload(dev) {
+    const rl = await run('networkctl', ['reload'], { timeout: 20000 });
+    if (rl.code !== 0) await sysd(['restart', 'systemd-networkd']);
+    if (dev) await run('networkctl', ['reconfigure', dev], { timeout: 20000 });
+  }
+  /** Netplan wifis entry for dev (Uiable's file first) -> networkd IP config to carry over. */
+  function ipFromNetplan(e) {
+    if (e && Array.isArray(e.addresses) && e.addresses.length && e.dhcp4 !== true) {
+      const gw = (e.routes || []).find((r) => r && (r.to === 'default' || r.to === '0.0.0.0/0'));
+      return { mode: 'static', address: String(e.addresses[0]), gateway: (gw || {}).via || e.gateway4 || '', dns: ((e.nameservers || {}).addresses || []).map(String) };
+    }
+    return { mode: 'dhcp' };
+  }
+  /**
+   * Switch dev's Wi-Fi to uiable-wpa@dev: write the supplicant conf (PMF off), the unit and a networkd .network
+   * (IP settings carried over from netplan, Wi-Fi route priority), drop dev from Uiable's netplan wifis so
+   * netplan-wpa-<dev> stops (no second supplicant), then start + enable. Returns an undo function.
+   */
+  async function ownWpaApply(d, dev, { ssid, psk, hidden, open }) {
+    const unit = `uiable-wpa@${dev}.service`;
+    const restoreFiles = await snapshotFiles([ownConfRel(dev), OWN_UNIT_REL, ownNetRel(dev), ownUplinkRel(dev)]);
+    const wasEnabled = /^enabled/.test(((await sysd(['is-enabled', unit], 10000)).stdout || '').trim());
+    const own = await readNetplanOwn();
+    const ownEntry = (((own.doc.network || {}).wifis) || {})[dev];
+    const existingNet = await fsp.readFile(hostFile(ownNetRel(dev)), 'utf8').catch(() => null);
+    const ip = existingNet ? null : ipFromNetplan(ownEntry);
+    const wp = planUplink((await loadPrefs()).uplinkMode || 'prefer-wired').wifi;
+    let restoreNetplan = null;
+    const undo = async () => {
+      await sysd(['stop', unit]);
+      if (!wasEnabled) await sysd(['disable', unit]);
+      await restoreFiles();
+      await sysd(['daemon-reload']);
+      if (restoreNetplan) { await restoreNetplan(); await run('netplan', ['apply'], { timeout: 90000 }); }
+      await networkdReload(dev);
+      if (wasEnabled) await sysd(['restart', unit]);
+    };
+    try {
+      await writeHost(ownConfRel(dev), buildOwnWpaConf({ ssid, psk, hidden, open }), 0o600);
+      await writeHost(OWN_UNIT_REL, OWN_WPA_UNIT, 0o644);
+      if (ip) await writeHost(ownNetRel(dev), buildNetworkdUnit(Object.assign({ device: dev, wifi: true }, ip)), 0o644);
+      if (!existingNet && ip.mode === 'dhcp') await writeHost(ownUplinkRel(dev), buildNetworkdUplinkDropin(wp), 0o644);
+      if (ownEntry && d.caps.bins.has('netplan')) {
+        restoreNetplan = await applyNetplan((doc) => {
+          const w = (doc.network || {}).wifis || {};
+          delete w[dev];
+          if (doc.network && !Object.keys(w).length) delete doc.network.wifis;
+          return doc;
+        });
+      }
+      if (d.caps.bins.has('netplan')) {
+        const other = await netplanGet(`network.wifis.${dev}`);
+        if (other) throw bad(`${dev} is also set up as Wi-Fi in another netplan file in /etc/netplan, which would start a second wpa_supplicant on it. Remove that wifis entry (or run Diagnostics to see which file) and try again.`, 409);
+      }
+      await sysd(['stop', `netplan-wpa-${dev}.service`]);
+      chk(await sysd(['daemon-reload']), 'systemctl daemon-reload');
+      await sysd(['enable', unit]);
+      chk(await sysd(['restart', unit]), `systemctl restart ${unit}`);
+      await networkdReload(dev);
+    } catch (e) { await undo().catch(() => {}); throw e; }
+    return undo;
+  }
+  /** Stop and remove uiable-wpa@dev (e.g. when NetworkManager takes over). Returns a restore function. */
+  async function ownWpaRemove(dev) {
+    const unit = `uiable-wpa@${dev}.service`;
+    const restoreFiles = await snapshotFiles([ownConfRel(dev), ownNetRel(dev), ownUplinkRel(dev)]);
+    await sysd(['disable', '--now', unit]);
+    for (const rel of [ownConfRel(dev), ownUplinkRel(dev), ownNetRel(dev)]) await fsp.unlink(hostFile(rel)).catch(() => {});
+    await fsp.rmdir(path.dirname(hostFile(ownUplinkRel(dev)))).catch(() => {});
+    await networkdReload(null);
+    return async () => { await restoreFiles(); await sysd(['daemon-reload']); await sysd(['enable', '--now', unit]); await networkdReload(dev); };
+  }
+  /** iwd: [General] ManagementFrameProtection=0 in /etc/iwd/main.conf, then restart iwd. Returns undo. */
+  async function iwdPmfOff() {
+    const rel = 'etc/iwd/main.conf';
+    const restore = await snapshotFiles([rel]);
+    const cur = await fsp.readFile(hostFile(rel), 'utf8').catch(() => '');
+    await writeHost(rel, setIniKey(cur, 'General', 'ManagementFrameProtection', '0'), 0o644);
+    await sysd(['restart', 'iwd']);
+    await sleep(opts.fast ? 0 : 3000);
+    return async () => { await restore(); await sysd(['restart', 'iwd']); };
+  }
+
   async function wifiConnect(d, { ssid, password, device, hidden }) {
     const b = d.backends;
     if (!b.wifi) throw bad(b.hasWifi ? d.summary : 'No Wi-Fi adapter was found on this host.', b.hasWifi ? 501 : 404);
@@ -1049,47 +1260,72 @@ function create({ run, root, dataDir, opts = {} }) {
     const plan = wifiSecurityPlan(security);
     if (plan.keyMgmt === 'eap') throw bad(`${ssid} is an enterprise (802.1X) network; Uiable can only join personal (password) Wi-Fi.`, 400);
     if (plan.keyMgmt === 'sae' && isHex) throw bad(`${ssid} is WPA3-only (SAE), which needs the actual password, not a 64-digit hex key.`, 400);
+    // PMF (802.11w): cards like the Intel Centrino Advanced-N 6205 (iwldvm) can't install the IGTK, so any AP that
+    // offers PMF fails right after associating. Detect up front (iw phy ciphers / driver) or from a failed attempt.
+    const cap = await pmfCapability(d, dev);
+    // NetworkManager already negotiates WPA2 without PMF on such cards, so let it; only force PMF off after a failure.
+    let noPmf = cap.pmf === false && !!password && b.wifi !== 'networkmanager';
+    const nmTip = !d.nm.installed && d.install && d.install.available ? ' NetworkManager handles cards without PMF automatically, so Install NetworkManager (Settings → Network) is the recommended setup for this card.' : '';
+    if (cap.pmf === false && password && plan.keyMgmt === 'sae') throw Object.assign(bad(wpa3NoPmfMessage(ssid, cap), 409), { code: 'no-pmf', reason: 'no-pmf' });
     if (b.wifi !== 'networkmanager') await run('ip', ['link', 'set', 'dev', dev, 'up'], { timeout: 8000 });
     if (b.wifi === 'networkmanager') {
       const nmMap = await nmDeviceMap(d);
       if (!nmManages(nmMap, dev)) await nmAdopt(d, [dev]);
     }
 
-    /** One attempt with a given key management; returns { res, undo, nmError, started }. */
-    const attempt = async (keyMgmt) => {
+    /** One attempt with a given key management (+ PMF off); returns { res, undo, nmError, started }. */
+    const attempt = async (keyMgmt, pmfOff) => {
       const started = Date.now();
       let undo = async () => {};
       let nmError = '';
       if (b.wifi === 'networkmanager') {
-        // NM detects WPA2/WPA3 from the scan and sets wifi-sec.key-mgmt itself.
-        const args = ['--wait', '45', 'device', 'wifi', 'connect', ssid];
-        if (password) args.push('password', password);
-        args.push('ifname', dev);
-        if (hidden) args.push('hidden', 'yes');
-        const r = await run('nmcli', args, { timeout: 60000 });
+        let r;
+        if (pmfOff && password) {
+          // Own profile so PMF can be disabled (wifi-sec.pmf 1 = disable) and key-mgmt pinned to WPA-PSK.
+          await run('nmcli', ['connection', 'delete', 'id', ssid], { timeout: 15000 });
+          const add = ['connection', 'add', 'type', 'wifi', 'con-name', ssid, 'ifname', dev, 'ssid', ssid, 'wifi-sec.key-mgmt', 'wpa-psk', 'wifi-sec.psk', password, 'wifi-sec.pmf', '1'];
+          if (hidden) add.push('802-11-wireless.hidden', 'yes');
+          r = await run('nmcli', add, { timeout: 30000 });
+          if (r.code === 0) r = await run('nmcli', ['--wait', '45', 'connection', 'up', 'id', ssid, 'ifname', dev], { timeout: 60000 });
+        } else {
+          // NM detects WPA2/WPA3 from the scan and sets wifi-sec.key-mgmt itself.
+          const args = ['--wait', '45', 'device', 'wifi', 'connect', ssid];
+          if (password) args.push('password', password);
+          args.push('ifname', dev);
+          if (hidden) args.push('hidden', 'yes');
+          r = await run('nmcli', args, { timeout: 60000 });
+        }
         if (r.code !== 0) nmError = scrub(errText(r), secrets);
-        undo = async () => { if (nmError) await run('nmcli', ['connection', 'delete', 'id', ssid], { timeout: 15000 }); };
+        undo = async () => { await run('nmcli', ['connection', 'delete', 'id', ssid], { timeout: 15000 }); };
+      } else if (viaNetplan && pmfOff) {
+        // netplan can't turn PMF off for the networkd renderer: run Uiable's own supplicant for this device.
+        const parked = await parkStaleNm(d);
+        let un;
+        try { un = await ownWpaApply(d, dev, { ssid, psk, hidden, open: !password }); } catch (e) { await parked.restore(); throw Object.assign(e, { message: scrub(e.message, secrets) }); }
+        undo = async () => { await un(); await parked.restore(); };
       } else if (viaNetplan) {
         // Give Wi-Fi a route priority that matches the Wired / Wi-Fi preference (default: prefer wired),
         // so joining Wi-Fi never silently steals the default route from the cable.
         const wp = planUplink((await loadPrefs()).uplinkMode || 'prefer-wired').wifi;
         const parked = await parkStaleNm(d);
-        let restoreFile;
+        let restoreFile, restoreOwn = null;
         try {
+          if (ownWpaActive(dev)) restoreOwn = await ownWpaRemove(dev); // never two supplicants on one card
           restoreFile = await applyNetplan((doc) => {
             const out = buildNetplanDoc(doc, { device: dev, wireless: true, wifi: { ssid, password, psk, hidden, keyMgmt, renderer: d.nm.running ? null : 'networkd' } });
             const e = out.network.wifis[dev];
             if (e.dhcp4 === true && !e['dhcp4-overrides']) e['dhcp4-overrides'] = { 'route-metric': wp.metric, 'use-routes': wp.defaultRoute };
             return out;
           });
-        } catch (e) { await parked.restore(); throw Object.assign(e, { message: scrub(e.message, secrets) }); }
-        undo = async () => { await restoreFile(); await parked.restore(); await run('netplan', ['apply'], { timeout: 90000 }); };
+        } catch (e) { if (restoreOwn) await restoreOwn().catch(() => {}); await parked.restore(); throw Object.assign(e, { message: scrub(e.message, secrets) }); }
+        undo = async () => { await restoreFile(); await parked.restore(); await run('netplan', ['apply'], { timeout: 90000 }); if (restoreOwn) await restoreOwn(); };
       } else if (b.wifi === 'iwd') {
+        const pmfUndo = pmfOff ? await iwdPmfOff() : null;
         const args = password ? ['--passphrase', password] : [];
         args.push('station', dev, hidden ? 'connect-hidden' : 'connect', ssid);
         const r = await run('iwctl', args, { timeout: 60000 });
         if (r.code !== 0) nmError = scrub(errText(r), secrets);
-        undo = async () => { await run('iwctl', ['known-networks', ssid, 'forget'], { timeout: 10000 }); };
+        undo = async () => { await run('iwctl', ['known-networks', ssid, 'forget'], { timeout: 10000 }); if (pmfUndo) await pmfUndo(); };
       } else {
         // wpa_supplicant: hex SSID + derived PSK, so the plaintext password never reaches argv.
         // WPA3-only (SAE) can't use a derived PSK, so that one case passes the quoted passphrase.
@@ -1100,6 +1336,7 @@ function create({ run, root, dataDir, opts = {} }) {
         const steps = [['set_network', id, 'ssid', Buffer.from(ssid, 'utf8').toString('hex')]];
         if (!password) steps.push(['set_network', id, 'key_mgmt', 'NONE']);
         else if (keyMgmt === 'sae') steps.push(['set_network', id, 'key_mgmt', 'SAE'], ['set_network', id, 'ieee80211w', '2'], ['set_network', id, 'psk', `"${password}"`]);
+        else if (pmfOff) steps.push(['set_network', id, 'key_mgmt', 'WPA-PSK'], ['set_network', id, 'psk', psk], ['set_network', id, 'ieee80211w', '0']);
         else {
           steps.push(['set_network', id, 'psk', psk]);
           if (plan.transition) steps.push(['set_network', id, 'ieee80211w', '1']);
@@ -1119,31 +1356,46 @@ function create({ run, root, dataDir, opts = {} }) {
 
     let nmUnmanagedList = [];
     if (d.nm.running) { try { const m = await nmDeviceMap(d); nmUnmanagedList = Object.keys(m).filter((k) => !nmManages(m, k)); } catch (_) { /* ignore */ } }
-    let keyMgmt = plan.keyMgmt === 'sae' ? 'sae' : 'psk';
-    let at = await attempt(keyMgmt);
-    let why = null;
-    const diagnose = async (x) => {
+    const diagnose = async (x, km, pmfOff) => {
       const [log, reg, rf2, mg] = await Promise.all([
         wifiLog(d, dev, x.started - 500),
         d.caps.bins.has('iw') ? run('iw', ['reg', 'get'], { timeout: 5000 }) : Promise.resolve({ stdout: '' }),
         rfkillState(),
         wifiManagers(dev, d.nm.running ? nmUnmanagedList : []),
       ]);
-      const w = classifyWifiFailure({ keyMismatch: mg.conflicts.length > 0, log: scrub(log, secrets), nmError: x.nmError, rfkill: rf2, associated: x.res.link.connected, ip: x.res.ip.length > 0, regdom: ((reg.stdout || '').match(/country (\w\w)/) || [])[1], security: plan.label + (keyMgmt === 'sae' && plan.keyMgmt !== 'sae' ? ', tried SAE' : ''), device: dev });
+      const label = plan.label + (km === 'sae' && plan.keyMgmt !== 'sae' ? ', tried SAE' : '') + (pmfOff ? ', PMF off' : '');
+      const w = classifyWifiFailure({ keyMismatch: mg.conflicts.length > 0, log: scrub(log, secrets), nmError: x.nmError, rfkill: rf2, associated: x.res.link.connected, ip: x.res.ip.length > 0, regdom: ((reg.stdout || '').match(/country (\w\w)/) || [])[1], security: label, device: dev });
       if (mg.conflicts.length && w.code !== 'no-dhcp') w.message += `\n\nConflict: ${mg.conflicts.join('; ')}. Only one Wi-Fi manager should control ${dev}.`;
       return w;
     };
-    if (!at.res.ok) {
-      why = await diagnose(at);
-      // WPA2/WPA3 transition networks that reject WPA2-PSK (PMF/SAE-only in practice), and hidden networks
-      // whose security we can't see: retry once with SAE.
-      if ((plan.transition || (hidden && plan.keyMgmt === 'unknown' && password)) && (b.wifi === 'wpa_supplicant' || viaNetplan) && /handshake-failed|wrong-password|assoc-reject|timeout/.test(why.code) && !isHex) {
-        await at.undo().catch(() => {});
-        keyMgmt = 'sae';
-        at = await attempt('sae');
-        why = at.res.ok ? null : await diagnose(at);
+
+    let keyMgmt = plan.keyMgmt === 'sae' ? 'sae' : 'psk';
+    const tried = new Set();
+    let at, why = null;
+    for (let i = 0; i < 3; i++) {
+      tried.add(`${keyMgmt}/${noPmf}`);
+      at = await attempt(keyMgmt, noPmf);
+      if (at.res.ok) { why = null; break; }
+      why = await diagnose(at, keyMgmt, noPmf);
+      let next = null;
+      if (why.code === 'no-pmf') {
+        await rememberNoPmf(dev, 'driver refused the IGTK key ("Failed to configure IGTK")');
+        if (plan.keyMgmt === 'sae') { why = { code: 'no-pmf', message: wpa3NoPmfMessage(ssid, await pmfCapability(d, dev)) + (why.message.includes('\n\n') ? why.message.slice(why.message.indexOf('\n\n')) : '') }; break; }
+        // Same network again with PMF off (and plain WPA2-PSK).
+        if (!noPmf) next = ['psk', true];
+      } else if (!noPmf && keyMgmt === 'psk' && (plan.transition || (hidden && plan.keyMgmt === 'unknown' && password)) && (b.wifi === 'wpa_supplicant' || viaNetplan) && /handshake-failed|wrong-password|assoc-reject|timeout/.test(why.code) && !isHex) {
+        // WPA2/WPA3 transition networks that reject WPA2-PSK (PMF/SAE-only in practice), and hidden networks
+        // whose security we can't see: retry once with SAE.
+        next = ['sae', false];
       }
+      if (!next || tried.has(`${next[0]}/${next[1]}`)) break;
+      await at.undo().catch(() => {});
+      [keyMgmt, noPmf] = next;
     }
+    if (why && why.code === 'no-pmf' && noPmf && plan.keyMgmt !== 'sae') {
+      why.message = 'Still failing with PMF (802.11w) turned off. The router probably requires PMF ("PMF required", or WPA3-only on some bands). Set it to WPA2/WPA3 mixed with PMF optional, or WPA2-only.' + (why.message.includes('\n\n') ? why.message.slice(why.message.indexOf('\n\n')) : '');
+    }
+    if (why && why.code === 'no-pmf' && nmTip) why.message = why.message.replace(/^([^\n]*)/, (m) => m + nmTip);
     invalidate();
     if (!at.res.ok) {
       if (why.code !== 'no-dhcp') await at.undo().catch(() => {}); // keep the network when only DHCP is slow
@@ -1151,23 +1403,27 @@ function create({ run, root, dataDir, opts = {} }) {
       throw Object.assign(bad(scrub(msg, secrets), 502), { code: why.code, reason: why.code });
     }
     const res = at.res;
-    const via = keyMgmt === 'sae' && b.wifi !== 'networkmanager' && b.wifi !== 'iwd' ? ' using WPA3 (SAE)' : '';
+    const via = (keyMgmt === 'sae' && b.wifi !== 'networkmanager' && b.wifi !== 'iwd' ? ' using WPA3 (SAE)' : '') +
+      (noPmf ? ' with PMF (802.11w) off, because this Wi-Fi card doesn\'t support it' : '');
+    const extra = (noPmf && viaNetplan ? ` Wi-Fi on ${dev} is now run by Uiable (uiable-wpa@${dev}) instead of netplan, and survives reboots.` : '') + (noPmf ? nmTip : '');
     if (b.wifi === 'wpa_supplicant' && !viaNetplan) {
       const save = await run('wpa_cli', ['-i', dev, 'save_config'], { timeout: 10000 });
-      if (!(save.code === 0 && /OK/.test(save.stdout))) return { output: `Connected ${dev} to ${ssid}${via} (${res.ip[0]}). Note: wpa_supplicant isn't set to save networks (update_config=1), so this won't survive a reboot.`, ip: res.ip[0], signal: res.link.signal, persisted: false, security: plan.label };
+      if (!(save.code === 0 && /OK/.test(save.stdout))) return { output: `Connected ${dev} to ${ssid}${via} (${res.ip[0]}). Note: wpa_supplicant isn't set to save networks (update_config=1), so this won't survive a reboot.`, ip: res.ip[0], signal: res.link.signal, persisted: false, security: plan.label, pmf: !noPmf };
     }
-    return { output: `Connected ${dev} to ${ssid}${via}, IP ${res.ip[0]}${res.link.signal != null ? `, signal ${res.link.signal}%` : ''}.`, ip: res.ip[0], signal: res.link.signal, persisted: true, security: plan.label };
+    return { output: `Connected ${dev} to ${ssid}${via}, IP ${res.ip[0]}${res.link.signal != null ? `, signal ${res.link.signal}%` : ''}.${extra}`, ip: res.ip[0], signal: res.link.signal, persisted: true, security: plan.label, pmf: !noPmf };
   }
 
   // ---- diagnostics (scrubbed) for the Wi-Fi card
   async function diagnostics(d, device) {
     const dev = device && validDev(device) ? device : (d.caps.wifiIfaces[0] || 'wlan0');
-    const units = ['NetworkManager', 'wpa_supplicant', 'iwd', 'systemd-networkd', `netplan-wpa-${dev}`];
+    const units = ['NetworkManager', 'wpa_supplicant', 'iwd', 'systemd-networkd', `netplan-wpa-${dev}`, `uiable-wpa@${dev}`];
     const script = [
       'sec() { printf "\\n### %s\\n" "$1"; }',
       'sec "rfkill"; (rfkill list 2>&1 || for r in /sys/class/rfkill/rfkill*; do [ -e "$r/type" ] && echo "$(cat $r/name) $(cat $r/type) soft=$(cat $r/soft) hard=$(cat $r/hard)"; done; true)',
       'sec "iw dev"; iw dev 2>&1', 'sec "iw reg get"; iw reg get 2>&1 | head -20',
       'sec "iw link"; iw dev "$1" link 2>&1',
+      'sec "iw phy ciphers (PMF needs BIP-CMAC-128 / 00-0f-ac:6)"; phy=$(cat /sys/class/net/"$1"/phy80211/name 2>/dev/null); iw phy "$phy" info 2>&1 | sed -n "/Supported Ciphers/,/Available Antennas\\|Supported interface modes/p" | head -20; echo "driver: $(basename "$(readlink /sys/class/net/"$1"/device/driver 2>/dev/null)" 2>/dev/null) $( [ -d /sys/module/iwldvm ] && echo "(iwldvm loaded)")"',
+      'sec "Uiable Wi-Fi supplicant"; printf "%-28s %s\\n" "uiable-wpa@$1" "$(systemctl is-active "uiable-wpa@$1" 2>&1)"; ls -l /etc/wpa_supplicant/uiable-"$1".conf /etc/systemd/network/10-uiable-"$1".network 2>&1',
       'sec "ip addr / routes"; ip -br addr 2>&1; ip route 2>&1',
       'sec "nmcli general"; nmcli general 2>&1', 'sec "nmcli device status"; nmcli device status 2>&1',
       `sec "services"; for u in ${units.join(' ')}; do printf "%-28s %s\\n" "$u" "$(systemctl is-active "$u" 2>&1)"; done`,
@@ -1182,7 +1438,16 @@ function create({ run, root, dataDir, opts = {} }) {
     const r = await run('sh', ['-c', script, 'uiable-diag', dev], { timeout: 45000 });
     const head = `Uiable network diagnostics · ${new Date().toISOString()}\nDevice: ${dev}\nBackends: wifi=${d.backends.wifi || 'none'} config=${d.backends.config || 'none'} link=${d.backends.link || 'none'} · NetworkManager ${d.nm.running ? 'running' : d.nm.installed ? 'installed, not running' : 'not installed'}\n${d.summary || ''}`;
     const stale = await staleNmFiles(d);
-    const extra = stale.length ? `\n\n### stale NetworkManager leftovers\n${stale.map((x) => '/' + x).join('\n')}\n(Uiable parks these in /etc/netplan/uiable-disabled when you connect.)` : '';
+    pmfCache.delete(dev);
+    const cap = await pmfCapability(d, dev).catch(() => ({ pmf: null, source: 'check failed' }));
+    const pkg = (d.install && d.install.pkg) || pickPkg(d.caps.bins);
+    const missing = ['iw', 'rfkill'].filter((x) => !d.caps.bins.has(x));
+    const inst = { apt: 'sudo apt install', dnf: 'sudo dnf install', yum: 'sudo yum install', zypper: 'sudo zypper install', apk: 'sudo apk add', pacman: 'sudo pacman -S' }[pkg];
+    const hints = [];
+    if (missing.length) hints.push(`Tip: ${missing.join(' and ')} ${missing.length > 1 ? 'are' : 'is'} not installed on the host, so some checks below are empty.${inst ? ` Install with: ${inst} ${pkg === 'pacman' ? missing.filter((x) => x !== 'rfkill').join(' ') || 'util-linux' : missing.join(' ')}` : ''}`);
+    hints.push(`PMF (802.11w) support on ${dev}: ${cap.pmf === true ? 'yes' : cap.pmf === false ? 'NO' : 'unknown'} (${cap.source}).${cap.pmf === false ? ` Uiable joins WPA2 and WPA2/WPA3-mixed networks with PMF off on this card (as NetworkManager does); WPA3-only networks cannot work with it.${!d.nm.installed && d.install && d.install.available ? ' Recommended: Install NetworkManager, which handles this automatically.' : ''}` : ''}`);
+    if (ownWpaActive(dev)) hints.push(`Wi-Fi on ${dev} is run by Uiable's own wpa_supplicant (uiable-wpa@${dev}, /etc/wpa_supplicant/uiable-${dev}.conf), not netplan.`);
+    const extra = '\n\n### summary\n' + hints.join('\n') + (stale.length ? `\n\n### stale NetworkManager leftovers\n${stale.map((x) => '/' + x).join('\n')}\n(Uiable parks these in /etc/netplan/uiable-disabled when you connect.)` : '');
     return { text: scrubDiagnostics(head + extra + '\n' + (r.stdout || '') + (r.stderr ? '\n' + r.stderr : ''), []), device: dev };
   }
 
@@ -1200,6 +1465,10 @@ function create({ run, root, dataDir, opts = {} }) {
         if (!bound || bound === dev) return { kind: 'networkmanager', name: p[0], uuid: p[1] };
       }
       return null;
+    }
+    if (ownWpaActive(dev)) {
+      const name = ownWpaSsid(await fsp.readFile(hostFile(ownConfRel(dev)), 'utf8').catch(() => ''));
+      if (name) return { kind: 'uiable-wpa', name };
     }
     const viaNetplan = b.wifi === 'netplan' || (b.wifi === 'wpa_supplicant' && b.config === 'netplan');
     if (viaNetplan) {
@@ -1240,12 +1509,19 @@ function create({ run, root, dataDir, opts = {} }) {
         const saved = await savedWifi(d, dev, nmMap);
         if (!saved) throw needsSsid(dev);
         if (saved.kind === 'networkmanager') return chk(await run('nmcli', ['--wait', '45', 'connection', 'up', 'uuid', saved.uuid, 'ifname', dev], { timeout: 60000 }), `nmcli connection up "${saved.name}"`);
+        if (saved.kind === 'uiable-wpa') {
+          chk(await run('ip', ['link', 'set', 'dev', dev, 'up'], { timeout: 10000 }), 'ip link set up');
+          chk(await sysd(['start', `uiable-wpa@${dev}.service`]), `start uiable-wpa@${dev}`);
+          await run('wpa_cli', ['-i', dev, 'reconnect'], { timeout: 10000 });
+          await run('networkctl', ['reconfigure', dev], { timeout: 20000 });
+          return;
+        }
       }
       if (d.nm.running && nmManages(nmMap, dev)) return chk(await run('nmcli', ['device', act, dev], { timeout: 60000 }), `nmcli device ${act}`);
       if (!b.link) throw bad('Interface control is not supported on this host (`ip` not found).', 501);
       if (act === 'disconnect') {
         if (wifi && b.wifi === 'iwd') return chk(await run('iwctl', ['station', dev, 'disconnect'], { timeout: 20000 }), 'iwd disconnect');
-        if (wifi && b.wifi === 'wpa_supplicant') return chk(await run('wpa_cli', ['-i', dev, 'disconnect'], { timeout: 10000 }), 'wpa_cli disconnect');
+        if (wifi && (b.wifi === 'wpa_supplicant' || ownWpaActive(dev))) return chk(await run('wpa_cli', ['-i', dev, 'disconnect'], { timeout: 10000 }), 'wpa_cli disconnect');
         return chk(await run('ip', ['link', 'set', 'dev', dev, 'down'], { timeout: 10000 }), 'ip link set down');
       }
       chk(await run('ip', ['link', 'set', 'dev', dev, 'up'], { timeout: 10000 }), 'ip link set up');
@@ -1261,6 +1537,7 @@ function create({ run, root, dataDir, opts = {} }) {
   // ---- IP settings
   function cfgBackendFor(d, nmMap, dev) {
     if (d.nm.running && nmManages(nmMap, dev)) return 'networkmanager';
+    if (ownWpaActive(dev) && fs.existsSync(hostFile(ownNetRel(dev)))) return 'systemd-networkd'; // uiable-wpa@dev + its .network
     return d.backends.fallbackConfig || (d.backends.config !== 'networkmanager' ? d.backends.config : null);
   }
 
@@ -1324,7 +1601,7 @@ function create({ run, root, dataDir, opts = {} }) {
         const rel = `etc/systemd/network/10-uiable-${cfg.device}.network`;
         const restoreFile = await snapshotFiles([rel]);
         await fsp.mkdir(path.dirname(hostFile(rel)), { recursive: true });
-        await fsp.writeFile(hostFile(rel), buildNetworkdUnit(cfg), { mode: 0o644 });
+        await fsp.writeFile(hostFile(rel), buildNetworkdUnit(Object.assign({}, cfg, { wifi: d.caps.wifiIfaces.includes(cfg.device) })), { mode: 0o644 });
         const reload = async () => {
           const rl = await run('networkctl', ['reload'], { timeout: 20000 });
           if (rl.code !== 0) chk(await run('systemctl', ['restart', 'systemd-networkd'], { timeout: 30000 }), 'restart systemd-networkd');
@@ -1411,7 +1688,7 @@ function create({ run, root, dataDir, opts = {} }) {
   }
 
   return {
-    detect, invalidate, scan, wifiConnect, overview, deviceAction, savedWifi, diagnostics, nmAdopt, staleNmFiles, getIpConfig, setIpConfig, setUplink,
+    detect, invalidate, scan, wifiConnect, pmfCapability, overview, deviceAction, savedWifi, diagnostics, nmAdopt, staleNmFiles, getIpConfig, setIpConfig, setUplink,
     confirmPending, revertPending, pendingInfo, NM_INSTALL_SCRIPT,
   };
 }
@@ -1420,6 +1697,7 @@ module.exports = {
   create, splitTerse, stripAnsi, dedupeNetworks, parseNmcliWifi, parseIwctlStations, parseIwctlShow, parseIwctlNetworks,
   parseWpaScanResults, parseKv, parseIwScan, unescapeSsid, wpaSecurity, freqToChannel, dbmToPercent, wpaPsk, validatePassphrase,
   scrub, validateIpConfig, buildNetworkdUnit, buildNetplanDoc, parseProbe,
+  parsePmfProbe, buildOwnWpaConf, ownWpaSsid, setIniKey, wpa3NoPmfMessage, OWN_WPA_UNIT, PMF_PROBE,
   parseIpAddrJson, parseDefaultRoutes, parseResolvectlDns, parseIwLink, parseIwctlKnown, parseWpaNetworks, relevantLog, wifiSecurityPlan, filterJournalSince, scrubDiagnostics, ifaceType, ifaceStatus, parseRfkill, classifyWifiFailure,
   planUplink, inferUplinkMode, netplanDefaultSource, applyUplinkToNetplan, buildNetworkdUplinkDropin, nmUplinkArgs, UPLINK_MODES, chooseBackends, describe, classifyHost, pickPkg,
   nmUnmanagedConf, NM_INSTALL_SCRIPT, NM_UIABLE_CONF, PROBE,
