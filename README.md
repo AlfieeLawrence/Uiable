@@ -118,7 +118,7 @@ Uiable is effectively **root on the host** (`privileged`, `pid: host`, `uts: hos
 ## Notes
 
 * Systemd hosts get the best Services / hostname / timezone experience; fallbacks exist.
-* Wi-Fi needs NetworkManager (`nmcli`).
+* Network management prefers NetworkManager (`nmcli`). Without it, Uiable falls back to iwd (`iwctl`) or wpa_supplicant (`wpa_cli`) for Wi-Fi, netplan or systemd-networkd for static/DHCP IP settings, and `ip` for bringing interfaces up/down; the Network page shows which backend is active and what isn't supported. On hosts that can take packages (apt, dnf, yum, pacman, zypper, apk) there is a one-click **Install NetworkManager** button (Wi-Fi only by default, so wired interfaces stay with your existing config). It's hidden on appliance/immutable hosts such as umbrelOS.
 * SMART needs `smartmontools` on the host; traceroute needs `traceroute` or `tracepath`.
 * App-store stacks live under `$UIABLE_DATA_DIR/stacks/`.
 * Absolute symlinks in the file manager resolve to the target; the editor opens text files up to 5 MB.
@@ -170,6 +170,7 @@ install.sh      Docker-aware installer (Umbrel-friendly)
 
 ## Changelog
 
+- **1.2.4** - Network page works without NetworkManager: falls back to iwd (`iwctl`) or wpa_supplicant (`wpa_cli`) for Wi-Fi, netplan or systemd-networkd for static/DHCP IP settings (new **IP settings…** per interface), and `ip link` for up/down, with a backend card showing what is active and unsupported. One-click **Install NetworkManager** (apt/dnf/yum/pacman/zypper/apk, live log; Wi-Fi-only by default so wired config stays unmanaged), hidden on umbrelOS/immutable hosts. Wi-Fi passwords never logged; wpa_supplicant gets a derived PSK, not the plaintext. Host PATH includes `/snap/bin`; Podman detected as a container. `npm test` unit tests.
 - **1.2.3** - Fix boot crash: /api/health registered on `api` before the router was declared (TDZ `ReferenceError` / Restarting (1)). Route is now on `app` as public liveness.
 - **1.2.0** - Metrics history (SQLite, 7-day default retention), themes, MIT LICENSE, audit secret redaction, encrypted secrets (OpenSSL AES-256-CBC PBKDF2), self-updater with checksum/health/rollback, backups/WireGuard/integrity, alerts (webhook/Discord/ntfy + history), API token scopes/expiry, RAID/ZFS safe actions, fail2ban, Podman socket, GPU/cpuTemp stats, GitHub Release CI, structured docs.
 - **1.1.3** - Removed the non-working "Done" button from the script run/output dialog (Close stays). Long script names in the Scripts list and editor header now truncate with "…" and scroll on hover (the list row was overflowing its card).

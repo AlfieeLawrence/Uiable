@@ -112,29 +112,13 @@ router.post('/services/:name/:action', wrap(async (req, res) => {
 }));
 
 // ---------------------------------------------------------------- network
-// nmcli -t escapes ':' as '\:' inside values.
-function splitTerse(line) {
-  const out = []; let cur = '';
-  for (let i = 0; i < line.length; i++) {
-    const c = line[i];
-    if (c === '\\' && i + 1 < line.length) { cur += line[++i]; continue; }
-    if (c === ':') { out.push(cur); cur = ''; continue; }
-    cur += c;
-  }
-  out.push(cur);
-  return out;
-}
-const NO_NM = 'NetworkManager (nmcli) is not available on this host, so Wi-Fi and connection management are disabled. Interfaces below are read-only.';
-
-async function nmAvailable() {
-  const r = await host.run('nmcli', ['-t', '-f', 'RUNNING', 'general'], { timeout: 8000 });
-  if (r.code !== 0) return { ok: false, message: notFound(r) ? NO_NM : `NetworkManager is installed but not usable: ${(r.stderr || '').trim() || 'nmcli failed'}` };
-  if (!/running/i.test(r.stdout)) return { ok: false, message: 'NetworkManager is installed but not running.' };
-  return { ok: true };
-}
+// Backends live in netbackends.js: NetworkManager first, then iwd / wpa_supplicant /
+// netplan / systemd-networkd / ip. All detection and commands run on the HOST (nsenter).
+const netb = require('./netbackends').create({ run: host.run, root: host.HOST_ROOT });
+const jobs = require('./jobs');
 
 router.get('/network', wrap(async (req, res) => {
-  const nm = await nmAvailable();
+  const d = await netb.detect(req.query.refresh === '1');
   let interfaces = [];
   const ip = await host.run('ip', ['-j', 'addr'], { timeout: 8000 });
   if (ip.code === 0) {
@@ -151,64 +135,76 @@ router.get('/network', wrap(async (req, res) => {
     o.stdout.split('\n').forEach((l) => { const p = l.trim().split(/\s+/); if (p.length > 3) { (map[p[1]] = map[p[1]] || { name: p[1], state: '', addresses: [] }).addresses.push(p[3]); } });
     interfaces = Object.values(map);
   }
-  let devices = [];
-  if (nm.ok) {
-    const d = await host.run('nmcli', ['-t', '-f', 'DEVICE,TYPE,STATE,CONNECTION', 'device'], { timeout: 8000 });
-    devices = d.stdout.split('\n').filter(Boolean).map((l) => { const p = splitTerse(l); return { device: p[0], type: p[1], state: p[2], connection: p[3] }; });
-  }
+  const devices = await netb.devices(d, interfaces).catch(() => []);
   const gw = await host.run('ip', ['route', 'show', 'default'], { timeout: 5000 });
   const dns = await fsp.readFile(path.join(host.HOST_ROOT, 'etc/resolv.conf'), 'utf8').catch(() => '');
+  const b = d.backends;
   res.json({
-    networkManager: nm.ok, message: nm.message || null, interfaces, devices,
+    networkManager: d.nm.running,
+    message: d.nm.running ? null : d.summary,
+    backend: { wifi: b.wifi, config: b.config, link: b.link, scan: b.scan, summary: d.summary, unsupported: d.unsupported, readOnly: d.readOnly },
+    nmInstall: d.install,
+    interfaces, devices,
     defaultRoute: gw.stdout.trim(),
     dns: dns.split('\n').filter((l) => l.startsWith('nameserver')).map((l) => l.split(/\s+/)[1]),
   });
 }));
 
 router.get('/wifi', wrap(async (req, res) => {
-  const nm = await nmAvailable();
-  if (!nm.ok) return res.json({ available: false, message: nm.message, networks: [] });
-  const rescan = req.query.rescan === '1' ? 'yes' : 'auto';
-  const r = await host.run('nmcli', ['-t', '-f', 'IN-USE,SSID,BSSID,SIGNAL,SECURITY,CHAN,DEVICE', 'device', 'wifi', 'list', '--rescan', rescan], { timeout: 30000 });
-  if (r.code !== 0) return res.json({ available: false, message: (r.stderr || 'Wi-Fi scan failed').trim(), networks: [] });
-  const best = {};
-  r.stdout.split('\n').filter(Boolean).forEach((l) => {
-    const p = splitTerse(l);
-    const n = { inUse: p[0] === '*', ssid: p[1], bssid: p[2], signal: +p[3] || 0, security: p[4] || '', channel: p[5], device: p[6] };
-    if (!n.ssid) return;
-    if (!best[n.ssid] || n.inUse || (n.signal > best[n.ssid].signal && !best[n.ssid].inUse)) best[n.ssid] = n;
-  });
-  const networks = Object.values(best).sort((a, b) => (b.inUse - a.inUse) || b.signal - a.signal);
-  if (!networks.length) {
-    const dev = await host.run('nmcli', ['-t', '-f', 'TYPE', 'device'], { timeout: 8000 });
-    if (!/^wifi$/m.test(dev.stdout)) return res.json({ available: false, message: 'No Wi-Fi adapter was found on this host.', networks: [] });
-  }
-  res.json({ available: true, networks });
+  const d = await netb.detect();
+  const b = d.backends;
+  if (!b.hasWifi) return res.json({ available: false, backend: b.wifi, message: 'No Wi-Fi adapter was found on this host.', networks: [] });
+  if (!b.wifi) return res.json({ available: false, backend: null, message: d.summary, networks: [] });
+  if (!b.scan) return res.json({ available: true, canScan: false, backend: b.wifi, message: 'Scanning needs `iw` on this host; you can still join a network by name.', networks: [] });
+  let networks;
+  try { networks = await netb.scan(d, req.query.rescan === '1'); } catch (e) { return res.json({ available: false, backend: b.wifi, message: e.message, networks: [] }); }
+  res.json({ available: true, canScan: true, backend: b.wifi, networks });
 }));
 
+// Body contains the Wi-Fi password: this path is in audit.js SECRET_PATH, and
+// netbackends scrubs it from any error text. Never log req.body here.
 router.post('/wifi/connect', wrap(async (req, res) => {
-  const nm = await nmAvailable();
-  if (!nm.ok) throw bad(nm.message, 501);
   const ssid = String(req.body.ssid || '');
-  if (!ssid || ssid.length > 64) throw bad('SSID required');
-  const args = ['device', 'wifi', 'connect', ssid];
-  if (req.body.password) args.push('password', String(req.body.password));
-  if (req.body.device) args.push('ifname', String(req.body.device).replace(/[^\w.\-]/g, ''));
-  if (req.body.hidden) args.push('hidden', 'yes');
-  const r = await host.run('nmcli', args, { timeout: 60000 });
-  if (r.code !== 0) throw fail(r, 'Wi-Fi connect');
-  res.json({ ok: true, output: r.stdout.trim() });
+  if (!ssid || Buffer.byteLength(ssid) > 32) throw bad('SSID required (max 32 bytes)');
+  const d = await netb.detect();
+  const out = await netb.wifiConnect(d, { ssid, password: req.body.password ? String(req.body.password) : '', device: req.body.device ? String(req.body.device).replace(/[^\w.\-]/g, '') : '', hidden: !!req.body.hidden });
+  netb.invalidate();
+  res.json(Object.assign({ ok: true }, out));
 }));
 
 router.post('/network/device/:dev/:action', wrap(async (req, res) => {
-  const nm = await nmAvailable();
-  if (!nm.ok) throw bad(nm.message, 501);
-  const dev = String(req.params.dev);
-  if (!/^[\w.\-]+$/.test(dev)) throw bad('Bad device');
-  if (!['connect', 'disconnect'].includes(req.params.action)) throw bad('Bad action');
-  const r = await host.run('nmcli', ['device', req.params.action, dev], { timeout: 60000 });
-  if (r.code !== 0) throw fail(r, `nmcli device ${req.params.action}`);
+  const d = await netb.detect();
+  await netb.deviceAction(d, String(req.params.dev), req.params.action);
+  netb.invalidate();
   res.json({ ok: true });
+}));
+
+router.get('/network/config/:dev', wrap(async (req, res) => {
+  const d = await netb.detect();
+  res.json(Object.assign({ backend: d.backends.config }, await netb.getIpConfig(d, String(req.params.dev))));
+}));
+
+router.post('/network/config', wrap(async (req, res) => {
+  const d = await netb.detect();
+  const out = await netb.setIpConfig(d, req.body || {});
+  netb.invalidate();
+  audit.write({ user: req.session.username, role: req.session.role, ip: req.socket.remoteAddress, action: 'network.ipconfig', ok: true, details: { iface: String(req.body.device || ''), kind: String(req.body.mode || ''), target: out.backend } });
+  res.json(Object.assign({ ok: true }, out));
+}));
+
+// One-click NetworkManager install (only offered when nmcli is missing and the host can take packages).
+router.post('/network/nm-install', wrap(async (req, res) => {
+  const d = await netb.detect(true);
+  if (d.nm.installed) throw bad('NetworkManager is already installed.', 409);
+  if (!d.install || !d.install.available) throw bad((d.install && d.install.reason) || 'NetworkManager cannot be installed on this host.', 501);
+  const mode = req.body.mode === 'all' ? 'all' : 'wifi-only';
+  const job = jobs.runHost('Install NetworkManager', req.session.username, 'sh', ['-c', netb.NM_INSTALL_SCRIPT, 'uiable-nm-install', d.install.pkg, mode, d.install.iwd ? '1' : '0'], {
+    banner: `$ install NetworkManager (${d.install.pkg}, ${mode === 'all' ? 'manage all interfaces' : 'Wi-Fi only, existing config left unmanaged'})\n`,
+    timeout: 30 * 60 * 1000,
+    onDone: () => netb.invalidate(),
+  });
+  audit.write({ user: req.session.username, role: req.session.role, ip: req.socket.remoteAddress, action: 'network.nm.install', ok: true, details: { kind: d.install.pkg, spec: mode, job: job.id } });
+  res.json({ ok: true, job: jobs.view(job) });
 }));
 
 // ---------------------------------------------------------------- hostname / timezone

@@ -14,12 +14,14 @@ const path = require('path');
 function detectMode() {
   const env = (process.env.UIABLE_HOST_MODE || '').toLowerCase();
   if (env === 'nsenter' || env === 'local') return env;
-  return fs.existsSync('/.dockerenv') ? 'nsenter' : 'local';
+  // /.dockerenv = Docker, /run/.containerenv = Podman
+  return fs.existsSync('/.dockerenv') || fs.existsSync('/run/.containerenv') ? 'nsenter' : 'local';
 }
 
 const MODE = detectMode();
 const HOST_ROOT = path.resolve(process.env.UIABLE_HOST_ROOT || (MODE === 'nsenter' ? '/host' : '/'));
-const HOST_PATH = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin';
+// /snap/bin (Ubuntu Core / snap NetworkManager) and NixOS profile paths, so host tools installed there are found too.
+const HOST_PATH = '/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin:/run/current-system/sw/bin:/run/current-system/sw/sbin';
 
 // No --wd: nsenter opens that path before entering the host mount namespace.
 function hostSpawnArgs(cmd, args) {

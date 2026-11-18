@@ -297,8 +297,8 @@ api.use('/files', (req, res, next) => {
 const system = require('./system');
 api.use('/system', (req, res, next) => {
   const p = req.path;
-  // Power, Linux users, hostname, timezone, wifi connect: admin only
-  if (/^\/(power|users|hostname|timezone)/.test(p) || (p === '/primary-mount' && req.method !== 'GET') || (p.startsWith('/wifi') && req.method !== 'GET') || (p.startsWith('/network/device') && req.method !== 'GET')) {
+  // Power, Linux users, hostname, timezone, wifi connect, network device/IP config/NM install: admin only
+  if (/^\/(power|users|hostname|timezone)/.test(p) || (p === '/primary-mount' && req.method !== 'GET') || (p.startsWith('/wifi') && req.method !== 'GET') || (p.startsWith('/network/') && req.method !== 'GET')) {
     return auth.role('admin')(req, res, next);
   }
   // Services write: operator+; read: viewer
