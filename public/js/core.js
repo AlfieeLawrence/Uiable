@@ -71,11 +71,11 @@ async function act(btn, fn, okMsg) {
 
 const openModals = new Set();
 function closeAllModals() { [...openModals].forEach((c) => c(null)); }
-function modal({ title, body = '', wide, full, buttons = [{ label: 'Close', value: null }], onOpen, dismissable = true }) {
+function modal({ title, body = '', wide, full, log, buttons = [{ label: 'Close', value: null }], onOpen, dismissable = true }) {
   return new Promise((resolve) => {
     const bg = document.createElement('div');
     bg.className = 'modal-bg';
-    bg.innerHTML = `<div class="modal ${wide ? 'wide' : ''} ${full ? 'wide full' : ''}"><header><h2 class="grow ellipsis">${esc(title)}</h2><button class="icon" data-x>${ICON.x}</button></header><div class="body">${body}</div><footer>${buttons.map((b, i) => `<button data-i="${i}" class="${b.cls || ''}">${esc(b.label)}</button>`).join('')}</footer></div>`;
+    bg.innerHTML = `<div class="modal ${wide ? 'wide' : ''} ${full ? 'wide full' : ''} ${log ? 'has-log' : ''}"><header><h2 class="grow ellipsis">${esc(title)}</h2><button class="icon" data-x>${ICON.x}</button></header><div class="body">${body}</div><footer>${buttons.map((b, i) => `<button data-i="${i}" class="${b.cls || ''}">${esc(b.label)}</button>`).join('')}</footer></div>`;
     const m = bg.firstChild;
     let cleanup = null;
     const close = (v) => { if (!openModals.has(close)) return; openModals.delete(close); if (cleanup) cleanup(); bg.remove(); document.removeEventListener('keydown', onKey); resolve(v); };
@@ -413,6 +413,25 @@ function rebuildDock() {
 }
 window.addEventListener('hashchange', route);
 
+/* Wide tables scroll inside their card instead of stretching the page (phones/tablets).
+   Any <table> rendered outside a .table-wrap gets a .table-scroll wrapper; the table node itself is
+   moved, not re-created, so references to its tbody stay valid. */
+(function () {
+  const wrap = (root) => {
+    if (!root || !root.querySelectorAll) return;
+    const list = root.tagName === 'TABLE' ? [root] : root.querySelectorAll('table');
+    for (const t of list) {
+      const p = t.parentElement;
+      if (!p || p.classList.contains('table-scroll') || p.classList.contains('table-wrap') || t.closest('.xterm')) continue;
+      const w = document.createElement('div'); w.className = 'table-scroll';
+      p.insertBefore(w, t); w.appendChild(t);
+    }
+  };
+  const mo = new MutationObserver((muts) => { for (const m of muts) for (const n of m.addedNodes) if (n.nodeType === 1) wrap(n); });
+  const start = () => { ['#app', '#modal-root'].forEach((s) => { const el = document.querySelector(s); if (el) { wrap(el); mo.observe(el, { childList: true, subtree: true }); } }); };
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', start); else start();
+})();
+
 async function logout() {
   try { await POST('/logout'); } catch (_) {}
   State.user = null; State.role = null; State.csrf = null; State.layout = null; if (typeof Home !== 'undefined') Home.layout = null; Stats.stop();
@@ -424,28 +443,35 @@ async function logout() {
 // Nothing streams while the tab is in the background.
 document.addEventListener('visibilitychange', () => { if (document.hidden) Stats.pause(); else Stats.connect(); });
 
-/** Watch a long-running job in a modal until it finishes. */
+/** Watch a long-running job in a modal until it finishes. Resolves with the last job state seen. */
 async function watchJob(job, title) {
-  if (!job || !job.id) return;
-  let timer;
+  if (!job || !job.id) return null;
+  let timer; let last = job;
   await modal({
-    title: title || job.title || 'Working…', wide: true,
-    body: `<pre class="out" data-job style="min-height:240px;max-height:60vh">Starting…</pre>`,
+    title: title || job.title || 'Working…', wide: true, log: true,
+    body: `<div class="job-status row small"><span class="spinner" data-jspin></span><span data-jstate class="muted">Running…</span><span class="spacer"></span><label class="row small"><input type="checkbox" data-jfollow checked> Follow</label></div><pre class="out log-out" data-job>Starting…</pre>`,
     buttons: [{ label: 'Close', value: true }],
     onOpen: (m) => {
       const pre = $('[data-job]', m);
+      const follow = $('[data-jfollow]', m);
       const tick = async () => {
         try {
-          const j = await GET('/jobs/' + job.id);
+          const j = last = await GET('/jobs/' + job.id);
+          const atEnd = pre.scrollHeight - pre.scrollTop - pre.clientHeight < 40;
           pre.textContent = j.output || '(no output yet)';
-          pre.scrollTop = pre.scrollHeight;
-          if (j.state === 'running') timer = setTimeout(tick, 1000);
+          if (follow.checked || atEnd) pre.scrollTop = pre.scrollHeight;
+          const st = $('[data-jstate]', m);
+          if (j.state === 'running') { timer = setTimeout(tick, 1000); return; }
+          $('[data-jspin]', m).remove();
+          st.textContent = j.state === 'done' ? 'Finished' : `Failed${j.code != null ? ' (exit ' + j.code + ')' : ''}`;
+          st.className = j.state === 'done' ? 'ok-text' : 'err-text';
         } catch (e) { pre.textContent += '\n' + e.message; }
       };
       tick();
       return () => clearTimeout(timer);
     },
   });
+  return last;
 }
 
 /* Marquee for names that may overflow their pill/tile: ellipsis at rest; on

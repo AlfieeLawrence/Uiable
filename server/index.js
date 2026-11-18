@@ -384,7 +384,7 @@ app.use((err, req, res, next) => {
     if (host.HOST_ROOT !== '/' && p.startsWith(host.HOST_ROOT)) p = p.slice(host.HOST_ROOT.length) || '/';
     message = p ? `${msgs[err.code]}: ${p}` : msgs[err.code];
   }
-  res.status(status).json({ error: message, saved: err.saved });
+  res.status(status).json({ error: message, saved: err.saved, reason: err.reason });
 });
 
 // ------------------------------------------------------------- websockets

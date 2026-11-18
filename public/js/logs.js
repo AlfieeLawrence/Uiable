@@ -6,7 +6,7 @@ Pages.logs = (el) => {
     <select data-since style="width:auto"><option>1 hour ago</option><option>15 minutes ago</option><option>6 hours ago</option><option>24 hours ago</option><option>7 days ago</option></select>
     <button data-go>${ICON.refresh} Query</button>
     <label class="row small"><input type="checkbox" data-follow> Live follow</label>
-  </div><div class="card flush"><pre class="out" data-out style="height:calc(100vh - 230px);overflow:auto;border-radius:0;margin:0">Pick a source and click Query.</pre></div>`;
+  </div><div class="card flush"><pre class="out log-out page-log" data-out style="border-radius:0;margin:0">Pick a source and click Query.</pre></div>`;
   const out = $('[data-out]', el); let ws = null;
   const stopFollow = () => { if (ws) { ws.onclose = null; ws.close(); ws = null; } $('[data-follow]', el).checked = false; };
   GET('/logs/sources').then((s) => {

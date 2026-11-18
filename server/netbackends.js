@@ -295,7 +295,9 @@ function chooseBackends(caps, nm) {
   }
   const link = nm.running ? 'networkmanager' : caps.bins.has('ip') ? 'ip' : null;
   const scan = wifi === 'netplan' ? (caps.bins.has('iw') ? 'iw' : null) : wifi;
-  return { wifi, config, link, scan, hasWifi };
+  // Used for interfaces NetworkManager leaves unmanaged (e.g. after a Wi-Fi-only NM install).
+  const fallbackConfig = caps.bins.has('netplan') && caps.netplanDir ? 'netplan' : (caps.bins.has('networkctl') && active(caps, 'systemd-networkd', 'systemd-networkd')) ? 'systemd-networkd' : null;
+  return { wifi, config, link, scan, hasWifi, fallbackConfig };
 }
 
 const NAMES = { networkmanager: 'NetworkManager', iwd: 'iwd (iwctl)', wpa_supplicant: 'wpa_supplicant (wpa_cli)', netplan: 'netplan', 'systemd-networkd': 'systemd-networkd', ip: 'ip link', iw: 'iw' };
@@ -321,6 +323,201 @@ function describe(b, nm) {
     summary = parts.length ? `${why} Using ${parts.join(', ')}.` : `${why} No other supported network backend was found, so interfaces are read-only.`;
   }
   return { summary, unsupported, readOnly: !b.wifi && !b.config && !b.link };
+}
+
+// ---------------------------------------------------------------- interfaces / routes / status (pure)
+const VIRT_KIND = /^(bridge|veth|vxlan|wireguard|tun|tap|dummy|macvlan|macvtap|ipvlan|bond|vlan|gre|gretap|ipip|sit|geneve|vrf|team|ip6tnl|nlmon)$/;
+const VIRT_NAME = /^(docker|br-|veth|virbr|lxc|lxd|cni|flannel|cali|tailscale|wg|tun|tap|zt|vmnet|vboxnet|podman|kube|weave|cilium|nordlynx|ham)/;
+
+/** `ip -j -d addr` */
+function parseIpAddrJson(stdout) {
+  let list;
+  try { list = JSON.parse(stdout || '[]'); } catch (_) { return []; }
+  return list.map((i) => {
+    const addrs = i.addr_info || [];
+    return {
+      name: i.ifname, state: i.operstate || '', flags: i.flags || [], mac: i.address || '', mtu: i.mtu,
+      kind: (i.linkinfo && i.linkinfo.info_kind) || '',
+      addresses: addrs.map((a) => `${a.local}/${a.prefixlen}`),
+      ipv4: addrs.filter((a) => a.family === 'inet' && a.scope !== 'host').map((a) => `${a.local}/${a.prefixlen}`),
+      ipv6: addrs.filter((a) => a.family === 'inet6' && a.scope === 'global').map((a) => `${a.local}/${a.prefixlen}`),
+      dynamic: addrs.some((a) => a.family === 'inet' && a.dynamic),
+    };
+  });
+}
+
+/** `ip -j route show default` (+ -6). Sorted best first (lowest metric). */
+function parseDefaultRoutes(stdout, family = 4) {
+  let list;
+  try { list = JSON.parse(stdout || '[]'); } catch (_) { return []; }
+  return list.filter((r) => r.dst === 'default' && r.dev).map((r) => ({ dev: r.dev, gateway: r.gateway || '', metric: Number(r.metric) || 0, proto: r.protocol || '', family, linkdown: (r.flags || []).includes('linkdown') }))
+    .sort((a, b) => (a.linkdown - b.linkdown) || a.metric - b.metric);
+}
+
+/** `resolvectl dns` -> { global: [...], links: { dev: [...] } } */
+function parseResolvectlDns(out) {
+  const res = { global: [], links: {} };
+  String(out || '').split('\n').forEach((l) => {
+    const g = l.match(/^Global:\s*(.*)$/);
+    const k = l.match(/^Link \d+ \(([^)]+)\):\s*(.*)$/);
+    const ips = (s) => s.trim().split(/\s+/).filter(Boolean).map((x) => x.replace(/%.*$/, '').replace(/#.*$/, '')).filter((x) => net.isIP(x));
+    if (g) res.global = ips(g[1]);
+    else if (k) res.links[k[1]] = ips(k[2]);
+  });
+  return res;
+}
+
+/** `iw dev <dev> link` */
+/** Names from `iwctl known-networks list` (table with ANSI colours and a header). */
+function parseIwctlKnown(out) {
+  const clean = String(out || '').replace(/\x1b\[[0-9;]*m/g, '');
+  return clean.split('\n').map((l) => l.trim()).filter((l) => l && !/^-+$/.test(l) && !/^Known Networks/i.test(l) && !/^Name\s+Security/i.test(l) && !/^No known networks/i.test(l))
+    .map((l) => l.replace(/^>\s*/, '').split(/\s{2,}/)[0]).filter(Boolean);
+}
+/** Rows from `wpa_cli list_networks`: [{ id, ssid, flags }]. */
+function parseWpaNetworks(out) {
+  return String(out || '').split('\n').filter((l) => /^\d+\t/.test(l)).map((l) => { const p = l.split('\t'); return { id: p[0], ssid: p[1] || '', flags: p[3] || '' }; });
+}
+
+function parseIwLink(out) {
+  const t = String(out || '');
+  if (!/^Connected to/m.test(t)) return { connected: false };
+  const g = (re) => (t.match(re) || [])[1];
+  const dbm = g(/signal:\s*(-?\d+)/);
+  return { connected: true, bssid: g(/^Connected to ([0-9a-f:]{17})/mi) || '', ssid: unescapeSsid(g(/^\s*SSID:\s?(.*)$/m) || ''), signal: dbm != null ? dbmToPercent(dbm) : null, dbm: dbm != null ? Number(dbm) : null, channel: freqToChannel(g(/freq:\s*([\d.]+)/)) };
+}
+
+function ifaceType(i, wifiIfaces) {
+  if (i.name === 'lo' || (i.flags || []).includes('LOOPBACK')) return 'loopback';
+  if ((wifiIfaces || []).includes(i.name)) return 'wifi';
+  if (VIRT_KIND.test(i.kind || '') || VIRT_NAME.test(i.name)) return 'virtual';
+  return 'ethernet';
+}
+
+/**
+ * Human state for one interface. wifi: { connected, ssid } from the Wi-Fi backend (or null).
+ * Returns { state, label, canLink }: canLink=false for loopback/virtual (no Connect/Disconnect).
+ */
+function ifaceStatus(i, type, wifi) {
+  const flags = i.flags || [];
+  const adminUp = flags.includes('UP');
+  const carrier = flags.includes('LOWER_UP') && !flags.includes('NO-CARRIER');
+  const hasIp = (i.ipv4 || []).length > 0 || (i.ipv6 || []).length > 0;
+  if (type === 'loopback') return { state: 'loopback', label: 'loopback', canLink: false };
+  if (type === 'virtual') {
+    if (!adminUp) return { state: 'down', label: 'down', canLink: false };
+    return carrier ? { state: 'active', label: 'active', canLink: false } : { state: 'idle', label: 'idle (nothing attached)', canLink: false };
+  }
+  if (!adminUp) return { state: 'down', label: 'down', canLink: true };
+  if (type === 'wifi') {
+    if (wifi && wifi.connected) return hasIp ? { state: 'connected', label: `connected${wifi.ssid ? ' to ' + wifi.ssid : ''}`, canLink: true } : { state: 'no-ip', label: `joined ${wifi.ssid || 'Wi-Fi'}, no IP yet`, canLink: true };
+    return { state: 'disconnected', label: 'not connected to Wi-Fi', canLink: true };
+  }
+  if (!carrier) return { state: 'no-cable', label: 'cable unplugged', canLink: true };
+  return hasIp ? { state: 'connected', label: 'connected', canLink: true } : { state: 'no-ip', label: 'up, no IP address', canLink: true };
+}
+
+/** `/sys/class/rfkill` dump lines "name type soft hard" */
+function parseRfkill(out) {
+  return String(out || '').split('\n').map((l) => l.trim().split(/\s+/)).filter((p) => p.length >= 4 && /^[01]$/.test(p[2]))
+    .map((p) => ({ name: p[0], type: p[1], soft: p[2] === '1', hard: p[3] === '1' }));
+}
+
+/**
+ * Turn a failed Wi-Fi attempt into one clear reason.
+ * ctx: { log, rfkill:[...], associated, ip, supplicantMissing, regdom, nmError, backend }
+ */
+function classifyWifiFailure(ctx) {
+  const log = String(ctx.log || '') + '\n' + String(ctx.nmError || '');
+  const wl = (ctx.rfkill || []).filter((r) => r.type === 'wlan');
+  if (wl.some((r) => r.hard)) return { code: 'rfkill-hard', message: 'Wi-Fi is switched off in hardware (rfkill hard block): check the laptop Wi-Fi switch/Fn key or the BIOS setting.' };
+  if (wl.some((r) => r.soft)) return { code: 'rfkill-soft', message: 'Wi-Fi is blocked by rfkill (soft block) and could not be unblocked. Run `rfkill unblock wifi` on the host.' };
+  if (ctx.supplicantMissing) return { code: 'no-supplicant', message: 'netplan needs wpa_supplicant to join Wi-Fi, but it is not installed on the host. Install it (`sudo apt install wpasupplicant`) or use Install NetworkManager.' };
+  if (/WRONG_KEY|4-Way Handshake failed|pre-shared key may be incorrect|reason=15\b|Secrets were required|invalid passphrase|Invalid (passphrase|key)|auth_failures=\d|Authentication failed|802\.1X.*failed|reason=2 locally/i.test(log)) return { code: 'wrong-password', message: 'Wrong Wi-Fi password: the access point rejected the key.' };
+  if (/NETWORK-NOT-FOUND|No network with SSID|not found|Network not found|SSID.*not (found|available)/i.test(log) && !ctx.associated) return { code: 'not-found', message: `The network wasn't found from this host.${ctx.regdom === '00' ? ' The Wi-Fi regulatory domain is not set (country 00), so some 5 GHz channels are disabled; set it with `iw reg set GB` (or your country).' : ' Check it is in range, and that the name (SSID) is spelled exactly.'}` };
+  if (/ASSOC-REJECT|association rejected|status_code=\d+/i.test(log) && !ctx.associated) return { code: 'assoc-reject', message: 'The access point rejected the connection (association rejected). It may limit clients by MAC address or need WPA3.' };
+  if (ctx.associated && !ctx.ip) return { code: 'no-dhcp', message: 'Joined the Wi-Fi network but did not get an IP address (DHCP timed out). Check the router\'s DHCP server or set a static IP with IP settings.' };
+  const tail = String(ctx.log || '').trim().split('\n').slice(-3).join(' | ');
+  return { code: 'timeout', message: `Wi-Fi did not connect within the time limit.${ctx.regdom === '00' ? ' Regulatory domain is unset (country 00).' : ''}${tail ? ' Last log: ' + tail.slice(0, 300) : ''}` };
+}
+
+// ---------------------------------------------------------------- uplink preference (pure)
+const UPLINK_MODES = ['prefer-wired', 'prefer-wifi', 'wired-only', 'wifi-only'];
+const METRIC_PRIMARY = 100;
+const METRIC_BACKUP = 600;
+/** Route metric + whether the interface may carry the default route, per type. */
+function planUplink(mode) {
+  if (!UPLINK_MODES.includes(mode)) throw Object.assign(new Error('Mode must be one of ' + UPLINK_MODES.join(', ')), { status: 400 });
+  const wifiFirst = mode === 'prefer-wifi' || mode === 'wifi-only';
+  return {
+    ethernet: { metric: wifiFirst ? METRIC_BACKUP : METRIC_PRIMARY, defaultRoute: mode !== 'wifi-only' },
+    wifi: { metric: wifiFirst ? METRIC_PRIMARY : METRIC_BACKUP, defaultRoute: mode !== 'wired-only' },
+  };
+}
+
+/** Guess the current mode from default routes (stored mode wins when present). */
+function inferUplinkMode(routes, types) {
+  const best = {};
+  routes.filter((r) => r.family === 4).forEach((r) => { const t = types[r.dev]; if ((t === 'ethernet' || t === 'wifi') && best[t] == null) best[t] = r.metric; });
+  if (best.ethernet != null && best.wifi != null) return best.wifi < best.ethernet ? 'prefer-wifi' : 'prefer-wired';
+  if (best.wifi != null) return 'wifi-only';
+  if (best.ethernet != null) return 'prefer-wired';
+  return null;
+}
+
+/** Merged netplan definition of an interface -> does it use DHCP / a static default route? */
+function netplanDefaultSource(def) {
+  const d = def || {};
+  const staticDefault = !!d.gateway4 || (d.routes || []).some((r) => r && (r.to === 'default' || r.to === '0.0.0.0/0'));
+  return { dhcp4: d.dhcp4 === true || d.dhcp4 === 'yes' || d.dhcp4 === 'true', dhcp6: d.dhcp6 === true || d.dhcp6 === 'yes', staticDefault };
+}
+
+/**
+ * Apply an uplink plan to Uiable's netplan document for one device.
+ * merged: `netplan get` of that device (all files). savedGateway: gateway to restore for Uiable-managed static.
+ * Returns { doc, warning, removedGateway }.
+ */
+function applyUplinkToNetplan(existing, { device, wireless, plan, merged, savedGateway }) {
+  const doc = existing && typeof existing === 'object' ? JSON.parse(JSON.stringify(existing)) : {};
+  doc.network = doc.network || {}; doc.network.version = 2;
+  const sect = wireless ? 'wifis' : 'ethernets';
+  doc.network[sect] = doc.network[sect] || {};
+  const own = doc.network[sect][device] || {};
+  const src = netplanDefaultSource(merged);
+  let warning = null, removedGateway = null;
+  const ownStatic = (own.routes || []).some((r) => r && r.to === 'default') || (own.addresses && own.dhcp4 === false);
+  if (ownStatic) {
+    const routes = (own.routes || []).filter((r) => !(r && r.to === 'default'));
+    const gw = ((own.routes || []).find((r) => r && r.to === 'default') || {}).via || savedGateway;
+    if (plan.defaultRoute && gw) routes.push({ to: 'default', via: gw, metric: plan.metric });
+    if (!plan.defaultRoute && gw) removedGateway = gw;
+    if (routes.length) own.routes = routes; else delete own.routes;
+  } else if (src.staticDefault) {
+    warning = `${device} has a fixed gateway in another netplan file, so Uiable can't change its priority. Use IP settings on ${device} to let Uiable manage it.`;
+  }
+  if (src.dhcp4 || own.dhcp4 === true) own['dhcp4-overrides'] = Object.assign({}, own['dhcp4-overrides'], { 'route-metric': plan.metric, 'use-routes': plan.defaultRoute });
+  if (src.dhcp6 || own.dhcp6 === true) own['dhcp6-overrides'] = Object.assign({}, own['dhcp6-overrides'], { 'route-metric': plan.metric, 'use-routes': plan.defaultRoute });
+  if (!src.dhcp4 && !own.dhcp4 && !ownStatic && !src.staticDefault && !merged) warning = `${device} isn't configured in netplan yet; connect it first.`;
+  if (Object.keys(own).length) {
+    // An interface with only overrides still needs dhcp4 declared or netplan rejects the overrides.
+    if (own['dhcp4-overrides'] && own.dhcp4 === undefined && src.dhcp4) own.dhcp4 = true;
+    if (own['dhcp6-overrides'] && own.dhcp6 === undefined && src.dhcp6) own.dhcp6 = true;
+    doc.network[sect][device] = own;
+  }
+  return { doc, warning, removedGateway };
+}
+
+/** systemd-networkd drop-in for route priority. */
+function buildNetworkdUplinkDropin(plan) {
+  return ['# Managed by Uiable (Wired / Wi-Fi preference).', '[DHCPv4]', `RouteMetric=${plan.metric}`, `UseGateway=${plan.defaultRoute ? 'yes' : 'no'}`, '', '[IPv6AcceptRA]', `RouteMetric=${plan.metric}`, `UseGateway=${plan.defaultRoute ? 'yes' : 'no'}`, ''].join('\n');
+}
+
+/** nmcli args to apply an uplink plan to a connection. */
+function nmUplinkArgs(con, plan) {
+  return ['connection', 'modify', con,
+    'ipv4.route-metric', String(plan.metric), 'ipv6.route-metric', String(plan.metric),
+    'ipv4.never-default', plan.defaultRoute ? 'no' : 'yes', 'ipv6.never-default', plan.defaultRoute ? 'no' : 'yes',
+    'connection.autoconnect-priority', String(plan.metric === METRIC_PRIMARY ? 20 : 10)];
 }
 
 // ---------------------------------------------------------------- NetworkManager installer (pure parts)
@@ -397,7 +594,7 @@ nmcli device status || true
 
 // ---------------------------------------------------------------- probe script (host)
 const PROBE = [
-  'for b in nmcli iwctl wpa_cli iw netplan networkctl ip ifup apt-get dnf yum pacman zypper apk rpm-ostree; do command -v "$b" >/dev/null 2>&1 && echo "bin:$b"; done',
+  'for b in nmcli iwctl wpa_cli wpa_supplicant iw rfkill resolvectl journalctl netplan networkctl ip ifup apt-get dnf yum pacman zypper apk rpm-ostree; do command -v "$b" >/dev/null 2>&1 && echo "bin:$b"; done',
   'for u in NetworkManager iwd systemd-networkd; do echo "unit:$u:$(systemctl is-active "$u" 2>/dev/null)"; done',
   'for p in iwd wpa_supplicant systemd-networkd NetworkManager; do pgrep -x "$p" >/dev/null 2>&1 && echo "proc:$p"; done',
   'for d in /sys/class/net/*; do { [ -e "$d/wireless" ] || [ -e "$d/phy80211" ]; } && echo "wifi:${d##*/}"; done',
@@ -407,7 +604,7 @@ const PROBE = [
 ].join('\n');
 
 // ---------------------------------------------------------------- runtime
-function create({ run, root }) {
+function create({ run, root, dataDir, opts = {} }) {
   const bad = (msg, status = 400) => Object.assign(new Error(msg), { status });
   const hostFile = (p) => path.join(root, p);
   let cache = null;
@@ -491,26 +688,214 @@ function create({ run, root }) {
     return dedupeNetworks(all);
   }
 
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const errText = (r) => (r.stderr || r.stdout || 'exit ' + r.code).trim();
+  const chk = (r, what) => { if (r.code !== 0) throw bad(`${what} failed: ${errText(r)}`, r.code === 127 ? 501 : 500); };
+
+  // ---- host files with snapshot/restore (for rollback)
+  async function snapshotFiles(rels) {
+    const snap = [];
+    for (const rel of rels) snap.push({ rel, text: await fsp.readFile(hostFile(rel), 'utf8').catch(() => null) });
+    return async () => {
+      for (const s of snap) {
+        if (s.text == null) await fsp.unlink(hostFile(s.rel)).catch(() => {});
+        else { await fsp.mkdir(path.dirname(hostFile(s.rel)), { recursive: true }); await fsp.writeFile(hostFile(s.rel), s.text, { mode: 0o600 }); }
+      }
+    };
+  }
+
+  const NETPLAN_OWN = 'etc/netplan/90-uiable.yaml';
   async function readNetplanOwn() {
-    const f = hostFile('etc/netplan/90-uiable.yaml');
+    const f = hostFile(NETPLAN_OWN);
     const text = await fsp.readFile(f, 'utf8').catch(() => null);
     return { file: f, text, doc: text ? (yaml.load(text) || {}) : {} };
   }
+  async function writeNetplanOwn(doc) {
+    const f = hostFile(NETPLAN_OWN);
+    const out = '# Managed by Uiable (Settings > Network). Other netplan files are left untouched.\n' + yaml.dump(doc, { lineWidth: -1 });
+    await fsp.mkdir(path.dirname(f), { recursive: true });
+    await fsp.writeFile(f, out, { mode: 0o600 });
+    await fsp.chmod(f, 0o600).catch(() => {});
+  }
+  async function netplanApply() { chk(await run('netplan', ['apply'], { timeout: 90000 }), 'netplan apply'); }
 
+  /** Mutate Uiable's netplan file, validate with `netplan generate` (restore on error), then apply. */
   async function applyNetplan(mutate) {
     const own = await readNetplanOwn();
-    const doc = mutate(own.doc);
-    const out = '# Managed by Uiable (Settings > Network). Other netplan files are left untouched.\n' + yaml.dump(doc, { lineWidth: -1 });
-    await fsp.mkdir(path.dirname(own.file), { recursive: true });
-    await fsp.writeFile(own.file, out, { mode: 0o600 });
-    await fsp.chmod(own.file, 0o600).catch(() => {});
+    const restore = await snapshotFiles([NETPLAN_OWN]);
+    await writeNetplanOwn(mutate(own.doc));
     const gen = await run('netplan', ['generate'], { timeout: 30000 });
-    if (gen.code !== 0) {
-      if (own.text == null) await fsp.unlink(own.file).catch(() => {}); else await fsp.writeFile(own.file, own.text, { mode: 0o600 });
-      throw bad(`netplan rejected the config: ${(gen.stderr || gen.stdout).trim()}`, 500);
+    if (gen.code !== 0) { await restore(); throw bad(`netplan rejected the config: ${errText(gen)}`, 500); }
+    await netplanApply();
+    return restore;
+  }
+  async function netplanGet(key) {
+    const r = await run('netplan', ['get', key], { timeout: 15000 });
+    if (r.code !== 0) return null;
+    try { const v = yaml.load(r.stdout); return v && typeof v === 'object' ? v : null; } catch (_) { return null; }
+  }
+
+  // ---- live interface state
+  async function nmDeviceMap(d) {
+    if (!d.nm.running) return {};
+    const r = await run('nmcli', ['-t', '-f', 'DEVICE,TYPE,STATE,CONNECTION', 'device'], { timeout: 8000 });
+    const m = {};
+    r.stdout.split('\n').filter(Boolean).forEach((l) => { const p = splitTerse(l); m[p[0]] = { type: p[1], state: p[2], connection: p[3] && p[3] !== '--' ? p[3] : '' }; });
+    return m;
+  }
+  const nmManages = (nmMap, dev) => !!nmMap[dev] && !/unmanaged|unavailable/.test(nmMap[dev].state);
+
+  /** Association info for one Wi-Fi interface, whatever the backend. */
+  async function wifiLink(d, dev, nmMap) {
+    if (d.nm.running && nmManages(nmMap || {}, dev)) {
+      const r = await run('nmcli', ['-t', '-f', 'ACTIVE,SSID,SIGNAL,CHAN,DEVICE', 'device', 'wifi', 'list', '--rescan', 'no'], { timeout: 10000 });
+      const row = r.stdout.split('\n').map(splitTerse).find((p) => p[0] === 'yes' && p[4] === dev);
+      if (row) return { connected: true, ssid: row[1], signal: +row[2] || null, channel: row[3] };
+      return { connected: false };
     }
-    const ap = await run('netplan', ['apply'], { timeout: 90000 });
-    if (ap.code !== 0) throw bad(`netplan apply failed: ${(ap.stderr || ap.stdout).trim()}`, 500);
+    if (d.caps.bins.has('iw')) {
+      const r = await run('iw', ['dev', dev, 'link'], { timeout: 8000 });
+      if (r.code === 0) return parseIwLink(r.stdout);
+    }
+    if (d.backends.wifi === 'iwd') {
+      const sh = parseIwctlShow((await run('iwctl', ['station', dev, 'show'], { timeout: 8000 })).stdout);
+      return /connected/i.test(sh.state || '') && !/dis/i.test(sh.state) ? { connected: true, ssid: sh.connectedNetwork || '' } : { connected: false };
+    }
+    if (d.caps.bins.has('wpa_cli')) {
+      const st = parseKv((await run('wpa_cli', ['-i', dev, 'status'], { timeout: 8000 })).stdout);
+      if (st.wpa_state === 'COMPLETED') {
+        const sp = parseKv((await run('wpa_cli', ['-i', dev, 'signal_poll'], { timeout: 8000 })).stdout);
+        return { connected: true, ssid: st.ssid || '', bssid: st.bssid || '', signal: sp.RSSI ? dbmToPercent(sp.RSSI) : null, channel: freqToChannel(st.freq) };
+      }
+      if (st.wpa_state) return { connected: false, wpaState: st.wpa_state };
+    }
+    return { connected: false };
+  }
+
+  /** Full picture for the Network page: interfaces with type/state/IP/gateway/DNS/Wi-Fi + uplink. */
+  async function overview(d) {
+    const [addr, r4, r6, dnsR, nmMap] = await Promise.all([
+      run('ip', ['-j', '-d', 'addr'], { timeout: 8000 }),
+      run('ip', ['-j', 'route', 'show', 'default'], { timeout: 5000 }),
+      run('ip', ['-j', '-6', 'route', 'show', 'default'], { timeout: 5000 }),
+      d.caps.bins.has('resolvectl') ? run('resolvectl', ['dns'], { timeout: 5000 }) : Promise.resolve({ code: 1, stdout: '' }),
+      nmDeviceMap(d),
+    ]);
+    const ifs = parseIpAddrJson(addr.stdout);
+    const routes = parseDefaultRoutes(r4.stdout, 4).concat(parseDefaultRoutes(r6.stdout, 6));
+    const dns = parseResolvectlDns(dnsR.stdout);
+    const resolv = await fsp.readFile(hostFile('etc/resolv.conf'), 'utf8').catch(() => '');
+    const globalDns = dns.global.length ? dns.global : resolv.split('\n').filter((l) => l.startsWith('nameserver')).map((l) => l.split(/\s+/)[1]).filter((x) => x && !/^127\.0\.0\.53$/.test(x));
+    const types = {};
+    const primary = routes.find((r) => r.family === 4 && !r.linkdown) || routes.find((r) => !r.linkdown) || null;
+    const interfaces = [];
+    for (const i of ifs) {
+      const type = ifaceType(i, d.caps.wifiIfaces);
+      types[i.name] = type;
+      const wifi = type === 'wifi' ? await wifiLink(d, i.name, nmMap).catch(() => ({ connected: false })) : null;
+      const st = ifaceStatus(i, type, wifi);
+      const gw = routes.filter((r) => r.dev === i.name);
+      const managedBy = type === 'loopback' || type === 'virtual' ? null : (d.nm.running && nmManages(nmMap, i.name)) ? 'networkmanager' : (d.backends.fallbackConfig || d.backends.config || null);
+      interfaces.push({
+        name: i.name, type, state: st.state, label: st.label, canLink: st.canLink && !!d.backends.link,
+        canConfig: !!managedBy && type !== 'virtual' && type !== 'loopback',
+        mac: i.mac, mtu: i.mtu, flags: i.flags, addresses: i.addresses, ipv4: i.ipv4, ipv6: i.ipv6, dhcp: i.dynamic,
+        gateway: (gw.find((r) => r.family === 4) || {}).gateway || '', gateway6: (gw.find((r) => r.family === 6) || {}).gateway || '',
+        metric: gw.length ? gw[0].metric : null, dns: dns.links[i.name] || [],
+        wifi: wifi && wifi.connected ? { ssid: wifi.ssid || '', signal: wifi.signal, channel: wifi.channel || '' } : null,
+        connection: (nmMap[i.name] || {}).connection || (wifi && wifi.connected ? wifi.ssid : '') || '',
+        managedBy, primary: !!primary && primary.dev === i.name,
+      });
+    }
+    const prefs = await loadPrefs();
+    return {
+      interfaces, routes, dns: globalDns,
+      uplink: {
+        primary: primary ? { dev: primary.dev, type: types[primary.dev] || '', gateway: primary.gateway, metric: primary.metric, ip: ((interfaces.find((x) => x.name === primary.dev) || {}).ipv4 || [])[0] || '' } : null,
+        mode: prefs.uplinkMode || inferUplinkMode(routes, types), modeStored: !!prefs.uplinkMode,
+        wired: interfaces.filter((x) => x.type === 'ethernet').map((x) => x.name),
+        wireless: interfaces.filter((x) => x.type === 'wifi').map((x) => x.name),
+        canSet: !!(d.nm.running || d.backends.fallbackConfig),
+      },
+      defaultRoute: primary ? `default via ${primary.gateway} dev ${primary.dev}${primary.metric ? ' metric ' + primary.metric : ''}` : '',
+    };
+  }
+
+  // ---- small persisted prefs (uplink mode, gateways parked by "X only")
+  async function loadPrefs() {
+    if (!dataDir) return {};
+    try { return JSON.parse(await fsp.readFile(path.join(dataDir, 'network.json'), 'utf8')); } catch (_) { return {}; }
+  }
+  async function savePrefs(p) {
+    if (!dataDir) return;
+    await fsp.mkdir(dataDir, { recursive: true });
+    await fsp.writeFile(path.join(dataDir, 'network.json'), JSON.stringify(p, null, 2), { mode: 0o600 });
+  }
+
+  // ---- guarded changes: auto-rollback unless confirmed (netplan try style)
+  let pending = null;
+  async function guarded(label, seconds, apply) {
+    if (pending) throw bad(`Another network change ("${pending.label}") is waiting for confirmation. Keep or revert it first.`, 409);
+    const secs = Math.max(15, Math.min(300, Number(seconds) || 60));
+    const { restore, result } = await apply();
+    const token = crypto.randomBytes(12).toString('hex');
+    const p = { token, label, expires: Date.now() + secs * 1000, restore };
+    p.timer = setTimeout(() => { if (pending === p) { pending = null; console.warn(`[network] "${label}" not confirmed within ${secs}s, rolling back`); restore().catch((e) => console.error('[network] rollback failed:', e.message)).finally(invalidate); } }, (opts.rollbackMs != null ? opts.rollbackMs : secs * 1000));
+    if (p.timer.unref) p.timer.unref();
+    pending = p;
+    invalidate();
+    return Object.assign({}, result, { pending: { token, seconds: secs, label } });
+  }
+  function confirmPending(token) {
+    if (!pending || pending.token !== token) throw bad('Nothing to confirm (it may already have been rolled back).', 409);
+    clearTimeout(pending.timer); const label = pending.label; pending = null;
+    return { ok: true, kept: label };
+  }
+  async function revertPending(token) {
+    if (!pending || pending.token !== token) throw bad('Nothing to revert.', 409);
+    clearTimeout(pending.timer); const p = pending; pending = null;
+    await p.restore(); invalidate();
+    return { ok: true, reverted: p.label };
+  }
+  const pendingInfo = () => (pending ? { token: pending.token, label: pending.label, secondsLeft: Math.max(0, Math.round((pending.expires - Date.now()) / 1000)) } : null);
+
+  // ---- Wi-Fi connect with verification
+  async function rfkillState() {
+    const r = await run('sh', ['-c', 'for r in /sys/class/rfkill/rfkill*; do [ -e "$r/type" ] && echo "$(cat $r/name) $(cat $r/type) $(cat $r/soft) $(cat $r/hard)"; done; true'], { timeout: 5000 });
+    return parseRfkill(r.stdout);
+  }
+  async function ensureRadioOn() {
+    let rf = (await rfkillState()).filter((x) => x.type === 'wlan');
+    if (rf.some((x) => x.soft && !x.hard)) {
+      await run('sh', ['-c', 'rfkill unblock wifi 2>/dev/null || for r in /sys/class/rfkill/rfkill*; do [ "$(cat $r/type)" = wlan ] && echo 0 > $r/soft; done; true'], { timeout: 8000 });
+      await sleep(opts.fast ? 0 : 1500);
+      rf = (await rfkillState()).filter((x) => x.type === 'wlan');
+    }
+    return rf;
+  }
+  async function hostIpv4(dev) {
+    const r = await run('ip', ['-j', '-4', 'addr', 'show', 'dev', dev], { timeout: 5000 });
+    return (parseIpAddrJson(r.stdout)[0] || {}).ipv4 || [];
+  }
+  async function wifiLog(d, dev, since) {
+    if (!d.caps.bins.has('journalctl')) return '';
+    const units = [`netplan-wpa-${dev}.service`, 'wpa_supplicant.service', `wpa_supplicant@${dev}.service`, 'iwd.service', 'systemd-networkd.service', 'NetworkManager.service'];
+    const r = await run('journalctl', ['--no-pager', '-o', 'cat', '-n', '120', '--since', `@${Math.floor(since / 1000)}`, ...units.flatMap((u) => ['-u', u])], { timeout: 10000 });
+    return r.stdout || '';
+  }
+
+  /** Poll until dev is associated (to ssid) and has an IPv4 address. */
+  async function waitForWifi(d, dev, ssid, ms) {
+    const until = Date.now() + ms;
+    let link = { connected: false }, ip = [];
+    do {
+      link = await wifiLink(d, dev, await nmDeviceMap(d)).catch(() => ({ connected: false }));
+      ip = await hostIpv4(dev);
+      if (link.connected && (!ssid || !link.ssid || link.ssid === ssid) && ip.length) return { ok: true, link, ip };
+      if (Date.now() >= until) break;
+      await sleep(opts.fast ? 0 : 2000);
+    } while (Date.now() < until);
+    return { ok: false, link, ip };
   }
 
   async function wifiConnect(d, { ssid, password, device, hidden }) {
@@ -518,156 +903,322 @@ function create({ run, root }) {
     if (!b.wifi) throw bad(b.hasWifi ? d.summary : 'No Wi-Fi adapter was found on this host.', b.hasWifi ? 501 : 404);
     validatePassphrase(password);
     const secrets = [password];
-    const fail = (r, what) => bad(`${what} failed: ${scrub((r.stderr || r.stdout || 'exit ' + r.code).trim(), secrets)}`, r.code === 127 ? 501 : 500);
+    const fail = (r, what) => bad(`${what} failed: ${scrub(errText(r), secrets)}`, r.code === 127 ? 501 : 500);
     const dev = device && validDev(device) ? device : d.caps.wifiIfaces[0];
+    if (!dev) throw bad('No Wi-Fi adapter was found on this host.', 404);
+    const started = Date.now();
+    const waitMs = opts.wifiWaitMs != null ? opts.wifiWaitMs : 40000;
+    const viaNetplan = b.wifi !== 'networkmanager' && (b.wifi === 'netplan' || (b.wifi === 'wpa_supplicant' && b.config === 'netplan'));
+
+    // Pre-flight: radio on, supplicant present (netplan needs wpa_supplicant), link up.
+    const rf = await ensureRadioOn();
+    const supplicantMissing = viaNetplan && !d.caps.bins.has('wpa_supplicant');
+    if (supplicantMissing || rf.some((x) => x.soft || x.hard)) {
+      throw bad(classifyWifiFailure({ rfkill: rf, supplicantMissing }).message, 409);
+    }
+    if (b.wifi !== 'networkmanager') await run('ip', ['link', 'set', 'dev', dev, 'up'], { timeout: 8000 });
+
+    let undo = async () => {};
+    let nmError = '';
     if (b.wifi === 'networkmanager') {
-      const args = ['device', 'wifi', 'connect', ssid];
+      const args = ['--wait', '45', 'device', 'wifi', 'connect', ssid];
       if (password) args.push('password', password);
-      if (device && validDev(device)) args.push('ifname', device);
+      args.push('ifname', dev);
       if (hidden) args.push('hidden', 'yes');
       const r = await run('nmcli', args, { timeout: 60000 });
-      if (r.code !== 0) throw fail(r, 'Wi-Fi connect');
-      return { output: scrub(r.stdout.trim(), secrets) };
-    }
-    if (!dev) throw bad('No Wi-Fi adapter was found on this host.', 404);
-    // Ubuntu-style hosts: netplan owns wpa_supplicant, so write it there (persists across reboots).
-    if (b.wifi === 'netplan' || (b.wifi === 'wpa_supplicant' && b.config === 'netplan')) {
-      await applyNetplan((doc) => buildNetplanDoc(doc, { device: dev, wireless: true, wifi: { ssid, password, hidden } }));
-      return { output: `Saved ${ssid} for ${dev} in netplan and applied.`, persisted: true };
-    }
-    if (b.wifi === 'iwd') {
+      if (r.code !== 0) nmError = scrub(errText(r), secrets);
+      undo = async () => { if (nmError) await run('nmcli', ['connection', 'delete', 'id', ssid], { timeout: 15000 }); };
+    } else if (viaNetplan) {
+      // Give Wi-Fi a route priority that matches the Wired / Wi-Fi preference (default: prefer wired),
+      // so joining Wi-Fi never silently steals the default route from the cable.
+      const wp = planUplink((await loadPrefs()).uplinkMode || 'prefer-wired').wifi;
+      undo = await applyNetplan((doc) => {
+        const out = buildNetplanDoc(doc, { device: dev, wireless: true, wifi: { ssid, password, hidden } });
+        const e = out.network.wifis[dev];
+        if (e.dhcp4 === true && !e['dhcp4-overrides']) e['dhcp4-overrides'] = { 'route-metric': wp.metric, 'use-routes': wp.defaultRoute };
+        return out;
+      });
+      const restoreFile = undo;
+      undo = async () => { await restoreFile(); await run('netplan', ['apply'], { timeout: 90000 }); };
+    } else if (b.wifi === 'iwd') {
       const args = password ? ['--passphrase', password] : [];
       args.push('station', dev, hidden ? 'connect-hidden' : 'connect', ssid);
       const r = await run('iwctl', args, { timeout: 60000 });
-      if (r.code !== 0) throw fail(r, 'iwd connect');
-      return { output: `Connected ${dev} to ${ssid} (iwd remembers it).`, persisted: true };
+      if (r.code !== 0) nmError = scrub(errText(r), secrets);
+      undo = async () => { await run('iwctl', ['known-networks', ssid, 'forget'], { timeout: 10000 }); };
+    } else {
+      // wpa_supplicant: hex SSID + derived PSK, so the plaintext password never reaches argv.
+      const w = (args, t = 10000) => run('wpa_cli', ['-i', dev, ...args], { timeout: t });
+      const add = await w(['add_network']);
+      const id = (add.stdout.trim().split('\n').pop() || '').trim();
+      if (add.code !== 0 || !/^\d+$/.test(id)) throw fail(add, 'wpa_cli add_network');
+      const steps = [['set_network', id, 'ssid', Buffer.from(ssid, 'utf8').toString('hex')]];
+      if (password) steps.push(['set_network', id, 'psk', /^[0-9a-f]{64}$/i.test(password) ? password.toLowerCase() : wpaPsk(ssid, password)]);
+      else steps.push(['set_network', id, 'key_mgmt', 'NONE']);
+      if (hidden) steps.push(['set_network', id, 'scan_ssid', '1']);
+      steps.push(['select_network', id]);
+      for (const s of steps) {
+        const r = await w(s);
+        if (r.code !== 0 || /FAIL/.test(r.stdout)) { await w(['remove_network', id]); throw bad(`wpa_cli ${s[0]} ${s[2] || ''} failed`.trim(), 500); }
+      }
+      undo = async () => { await w(['remove_network', id]); await w(['save_config']); };
+      if (b.config === 'systemd-networkd') await run('networkctl', ['reconfigure', dev], { timeout: 20000 });
     }
-    // wpa_supplicant: hex SSID + derived PSK, so the plaintext password never reaches argv.
-    const w = (args, t = 10000) => run('wpa_cli', ['-i', dev, ...args], { timeout: t });
-    const add = await w(['add_network']);
-    const id = (add.stdout.trim().split('\n').pop() || '').trim();
-    if (add.code !== 0 || !/^\d+$/.test(id)) throw fail(add, 'wpa_cli add_network');
-    const steps = [['set_network', id, 'ssid', Buffer.from(ssid, 'utf8').toString('hex')]];
-    if (password) steps.push(['set_network', id, 'psk', /^[0-9a-f]{64}$/i.test(password) ? password.toLowerCase() : wpaPsk(ssid, password)]);
-    else steps.push(['set_network', id, 'key_mgmt', 'NONE']);
-    if (hidden) steps.push(['set_network', id, 'scan_ssid', '1']);
-    steps.push(['select_network', id]);
-    for (const s of steps) {
-      const r = await w(s);
-      if (r.code !== 0 || /FAIL/.test(r.stdout)) { await w(['remove_network', id]); throw bad(`wpa_cli ${s[0]} ${s[2] || ''} failed`.trim(), 500); }
+
+    const res = nmError && b.wifi === 'iwd' ? { ok: false, link: { connected: false }, ip: [] } : await waitForWifi(d, dev, ssid, nmError ? Math.min(waitMs, 3000) : waitMs);
+    invalidate();
+    if (!res.ok) {
+      const [log, reg, rf2] = await Promise.all([
+        wifiLog(d, dev, started - 2000),
+        d.caps.bins.has('iw') ? run('iw', ['reg', 'get'], { timeout: 5000 }) : Promise.resolve({ stdout: '' }),
+        rfkillState(),
+      ]);
+      const why = classifyWifiFailure({ log: scrub(log, secrets), nmError, rfkill: rf2, associated: res.link.connected, ip: res.ip.length > 0, regdom: ((reg.stdout || '').match(/country (\w\w)/) || [])[1] });
+      if (why.code !== 'no-dhcp') await undo().catch(() => {}); // keep the network when only DHCP is slow
+      throw Object.assign(bad(why.message + (why.code !== 'no-dhcp' ? ' The Wi-Fi settings were rolled back.' : ''), 502), { code: why.code });
     }
-    const save = await w(['save_config']);
-    const persisted = save.code === 0 && /OK/.test(save.stdout);
-    return { output: `Connecting ${dev} to ${ssid} via wpa_supplicant.${persisted ? '' : ' Note: wpa_supplicant is not set to save networks (update_config=1), so this will not survive a reboot.'}`, persisted };
+    if (b.wifi === 'wpa_supplicant' && !viaNetplan) {
+      const save = await run('wpa_cli', ['-i', dev, 'save_config'], { timeout: 10000 });
+      if (!(save.code === 0 && /OK/.test(save.stdout))) return { output: `Connected ${dev} to ${ssid} (${res.ip[0]}). Note: wpa_supplicant isn't set to save networks (update_config=1), so this won't survive a reboot.`, ip: res.ip[0], signal: res.link.signal, persisted: false };
+    }
+    return { output: `Connected ${dev} to ${ssid}, IP ${res.ip[0]}${res.link.signal != null ? `, signal ${res.link.signal}%` : ''}.`, ip: res.ip[0], signal: res.link.signal, persisted: true };
   }
 
-  // ---- devices / link control
-  async function devices(d, interfaces) {
+  // ---- saved Wi-Fi profiles (so "Connect" on an interface row never runs a bare `nmcli device connect`)
+  /** The saved network a Wi-Fi interface can reconnect to, or null when one must be picked first. */
+  async function savedWifi(d, dev, nmMap) {
     const b = d.backends;
-    if (b.config === 'networkmanager') {
-      const r = await run('nmcli', ['-t', '-f', 'DEVICE,TYPE,STATE,CONNECTION', 'device'], { timeout: 8000 });
-      return r.stdout.split('\n').filter(Boolean).map((l) => { const p = splitTerse(l); return { device: p[0], type: p[1], state: p[2], connection: p[3] }; });
+    if (d.nm.running && nmManages(nmMap || {}, dev)) {
+      const r = await run('nmcli', ['-t', '-f', 'NAME,UUID,TYPE,TIMESTAMP', 'connection', 'show'], { timeout: 10000 });
+      const wl = r.code === 0 ? r.stdout.split('\n').filter(Boolean).map(splitTerse)
+        .filter((p) => /^(802-11-wireless|wifi)$/.test(p[2] || '')).sort((x, y) => (+y[3] || 0) - (+x[3] || 0)) : [];
+      for (const p of wl.slice(0, 25)) {
+        const ifn = await run('nmcli', ['-g', 'connection.interface-name', 'connection', 'show', 'uuid', p[1]], { timeout: 8000 });
+        const bound = ifn.code === 0 ? ifn.stdout.trim() : '';
+        if (!bound || bound === dev) return { kind: 'networkmanager', name: p[0], uuid: p[1] };
+      }
+      return null;
     }
-    const wifiState = {};
+    const viaNetplan = b.wifi === 'netplan' || (b.wifi === 'wpa_supplicant' && b.config === 'netplan');
+    if (viaNetplan) {
+      const own = await readNetplanOwn();
+      const aps = (((own.doc.network || {}).wifis || {})[dev] || {})['access-points'] || (d.caps.bins.has('netplan') ? await netplanGet(`network.wifis.${dev}.access-points`) : null);
+      const names = aps && typeof aps === 'object' ? Object.keys(aps) : [];
+      if (names.length) return { kind: 'netplan', name: names[0] };
+      if (b.wifi === 'netplan') return null;
+    }
     if (b.wifi === 'iwd') {
-      for (const s of await iwdDevices(d)) {
-        const sh = parseIwctlShow((await run('iwctl', ['station', s.device, 'show'], { timeout: 8000 })).stdout);
-        wifiState[s.device] = { state: s.state || sh.state, connection: sh.connectedNetwork || '' };
-      }
-    } else if (b.wifi === 'wpa_supplicant') {
-      for (const dev of d.caps.wifiIfaces) {
-        const st = parseKv((await run('wpa_cli', ['-i', dev, 'status'], { timeout: 8000 })).stdout);
-        if (st.wpa_state) wifiState[dev] = { state: st.wpa_state === 'COMPLETED' ? 'connected' : 'disconnected', connection: st.wpa_state === 'COMPLETED' ? (st.ssid || '') : '' };
-      }
+      const r = await run('iwctl', ['known-networks', 'list'], { timeout: 10000 });
+      const rows = parseIwctlKnown(r.stdout);
+      return rows.length ? { kind: 'iwd', name: rows[0] } : null;
     }
-    return interfaces.map((i) => {
-      const wifi = d.caps.wifiIfaces.includes(i.name);
-      const type = i.name === 'lo' ? 'loopback' : wifi ? 'wifi' : /^(wg|tun|tap|docker|br-|veth|virbr|tailscale|zt)/.test(i.name) ? 'virtual' : 'ethernet';
-      const ws = wifiState[i.name];
-      const up = /^(up|unknown)$/i.test(i.state || '');
-      const state = ws ? ws.state : (up && (i.addresses || []).length ? 'connected' : up ? 'up' : 'disconnected');
-      return { device: i.name, type, state, connection: ws ? ws.connection : '' };
-    });
+    if (b.wifi === 'wpa_supplicant') {
+      const r = await run('wpa_cli', ['-i', dev, 'list_networks'], { timeout: 10000 });
+      const rows = parseWpaNetworks(r.stdout);
+      return rows.length ? { kind: 'wpa_supplicant', name: rows[0].ssid, id: rows[0].id } : null;
+    }
+    return null;
   }
+  const needsSsid = (dev) => Object.assign(bad(`${dev} has no saved Wi-Fi network yet. Pick a network and enter its password to connect.`, 409), { reason: 'needs-ssid' });
 
-  async function deviceAction(d, dev, action) {
+  // ---- link up/down
+  async function deviceAction(d, dev, action, { seconds } = {}) {
     const b = d.backends;
     if (!validDev(dev)) throw bad('Bad device');
     if (!['connect', 'disconnect'].includes(action)) throw bad('Bad action');
-    const chk = (r, what) => { if (r.code !== 0) throw bad(`${what} failed: ${(r.stderr || r.stdout || 'exit ' + r.code).trim()}`, r.code === 127 ? 501 : 500); };
-    if (b.link === 'networkmanager') return chk(await run('nmcli', ['device', action, dev], { timeout: 60000 }), `nmcli device ${action}`);
-    if (!b.link) throw bad('Interface control is not supported on this host (`ip` not found).', 501);
-    const wifi = d.caps.wifiIfaces.includes(dev);
-    if (action === 'disconnect') {
-      if (wifi && b.wifi === 'iwd') return chk(await run('iwctl', ['station', dev, 'disconnect'], { timeout: 20000 }), 'iwd disconnect');
-      if (wifi && b.wifi === 'wpa_supplicant') return chk(await run('wpa_cli', ['-i', dev, 'disconnect'], { timeout: 10000 }), 'wpa_cli disconnect');
-      return chk(await run('ip', ['link', 'set', 'dev', dev, 'down'], { timeout: 10000 }), 'ip link set down');
-    }
-    chk(await run('ip', ['link', 'set', 'dev', dev, 'up'], { timeout: 10000 }), 'ip link set up');
-    if (wifi && b.wifi === 'wpa_supplicant') await run('wpa_cli', ['-i', dev, 'reconnect'], { timeout: 10000 });
-    if (wifi && b.wifi === 'iwd') await run('iwctl', ['station', dev, 'scan'], { timeout: 10000 }); // iwd auto-joins known networks
-    if (b.config === 'systemd-networkd') await run('networkctl', ['reconfigure', dev], { timeout: 20000 });
+    const nmMap = await nmDeviceMap(d);
+    const ifs = parseIpAddrJson((await run('ip', ['-j', '-d', 'addr', 'show', 'dev', dev], { timeout: 5000 })).stdout);
+    const type = ifs[0] ? ifaceType(ifs[0], d.caps.wifiIfaces) : (d.caps.wifiIfaces.includes(dev) ? 'wifi' : 'ethernet');
+    if (type === 'virtual' || type === 'loopback') throw bad(`${dev} is a ${type} interface (e.g. a Docker bridge); it's managed by its owner, not here.`, 400);
+    const wifi = type === 'wifi';
+    const doAct = async (act) => {
+      if (wifi && act === 'connect') {
+        // A bare `nmcli device connect wlan0` fails with "A 'wireless' setting is required if no AP path
+        // was given" when there is no profile; bring up the saved one, or ask the UI for an SSID.
+        const saved = await savedWifi(d, dev, nmMap);
+        if (!saved) throw needsSsid(dev);
+        if (saved.kind === 'networkmanager') return chk(await run('nmcli', ['--wait', '45', 'connection', 'up', 'uuid', saved.uuid, 'ifname', dev], { timeout: 60000 }), `nmcli connection up "${saved.name}"`);
+      }
+      if (d.nm.running && nmManages(nmMap, dev)) return chk(await run('nmcli', ['device', act, dev], { timeout: 60000 }), `nmcli device ${act}`);
+      if (!b.link) throw bad('Interface control is not supported on this host (`ip` not found).', 501);
+      if (act === 'disconnect') {
+        if (wifi && b.wifi === 'iwd') return chk(await run('iwctl', ['station', dev, 'disconnect'], { timeout: 20000 }), 'iwd disconnect');
+        if (wifi && b.wifi === 'wpa_supplicant') return chk(await run('wpa_cli', ['-i', dev, 'disconnect'], { timeout: 10000 }), 'wpa_cli disconnect');
+        return chk(await run('ip', ['link', 'set', 'dev', dev, 'down'], { timeout: 10000 }), 'ip link set down');
+      }
+      chk(await run('ip', ['link', 'set', 'dev', dev, 'up'], { timeout: 10000 }), 'ip link set up');
+      if (wifi && b.wifi === 'wpa_supplicant') { await run('wpa_cli', ['-i', dev, 'enable_network', 'all'], { timeout: 10000 }); await run('wpa_cli', ['-i', dev, 'reconnect'], { timeout: 10000 }); }
+      if (wifi && b.wifi === 'iwd') await run('iwctl', ['station', dev, 'scan'], { timeout: 10000 });
+      if ((b.fallbackConfig || b.config) === 'systemd-networkd' || (b.fallbackConfig || b.config) === 'netplan') await run('networkctl', ['reconfigure', dev], { timeout: 20000 });
+    };
+    if (action === 'connect') { await doAct('connect'); invalidate(); return { ok: true }; }
+    // Disconnecting can cut this session: guard it so it comes back on its own.
+    return guarded(`Disconnect ${dev}`, seconds, async () => { await doAct('disconnect'); return { restore: () => doAct('connect'), result: { ok: true } }; });
   }
 
   // ---- IP settings
+  function cfgBackendFor(d, nmMap, dev) {
+    if (d.nm.running && nmManages(nmMap, dev)) return 'networkmanager';
+    return d.backends.fallbackConfig || (d.backends.config !== 'networkmanager' ? d.backends.config : null);
+  }
+
   async function getIpConfig(d, dev) {
     if (!validDev(dev)) throw bad('Bad device');
-    const b = d.backends;
-    if (b.config === 'netplan') {
+    const be = cfgBackendFor(d, await nmDeviceMap(d), dev);
+    if (be === 'netplan') {
       const { doc } = await readNetplanOwn();
       const n = doc.network || {};
       const e = (n.ethernets || {})[dev] || (n.wifis || {})[dev];
-      if (!e) return { managed: false };
-      return { managed: true, mode: e.addresses ? 'static' : 'dhcp', address: (e.addresses || [])[0] || '', gateway: ((e.routes || [])[0] || {}).via || '', dns: ((e.nameservers || {}).addresses || []).join(', ') };
+      if (!e || (!e.addresses && e.dhcp4 === undefined)) return { backend: be, managed: false };
+      const gw = (e.routes || []).find((r) => r && r.to === 'default');
+      const prefs = await loadPrefs();
+      return { backend: be, managed: true, mode: e.addresses ? 'static' : 'dhcp', address: (e.addresses || [])[0] || '', gateway: (gw || {}).via || ((prefs.parkedGateways || {})[dev] || ''), dns: ((e.nameservers || {}).addresses || []).join(', ') };
     }
-    if (b.config === 'systemd-networkd') {
+    if (be === 'systemd-networkd') {
       const t = await fsp.readFile(hostFile(`etc/systemd/network/10-uiable-${dev}.network`), 'utf8').catch(() => null);
-      if (!t) return { managed: false };
+      if (!t) return { backend: be, managed: false };
       const get = (k) => (t.match(new RegExp(`^${k}=(.*)$`, 'gm')) || []).map((l) => l.split('=')[1]);
-      return { managed: true, mode: /DHCP=yes/.test(t) ? 'dhcp' : 'static', address: get('Address')[0] || '', gateway: get('Gateway')[0] || '', dns: get('DNS').join(', ') };
+      return { backend: be, managed: true, mode: /DHCP=yes/.test(t) ? 'dhcp' : 'static', address: get('Address')[0] || '', gateway: get('Gateway')[0] || '', dns: get('DNS').join(', ') };
     }
-    return { managed: false };
+    return { backend: be, managed: false };
   }
 
-  async function setIpConfig(d, body) {
+  async function nmSnapshot(con, keys) {
+    const r = await run('nmcli', ['-g', keys.join(','), 'connection', 'show', con], { timeout: 10000 });
+    const vals = r.stdout.replace(/\n$/, '').split('\n');
+    return async () => {
+      const args = ['connection', 'modify', con];
+      keys.forEach((k, i) => args.push(k, (vals[i] || '').replace(/\\:/g, ':')));
+      await run('nmcli', args, { timeout: 30000 });
+      await run('nmcli', ['connection', 'up', con], { timeout: 60000 });
+    };
+  }
+
+  async function setIpConfig(d, body, { seconds } = {}) {
     const cfg = validateIpConfig(body);
-    const b = d.backends;
-    const chk = (r, what) => { if (r.code !== 0) throw bad(`${what} failed: ${(r.stderr || r.stdout || 'exit ' + r.code).trim()}`, 500); };
-    if (b.config === 'networkmanager') {
-      const devs = await devices(d, []);
-      const con = (devs.find((x) => x.device === cfg.device) || {}).connection;
-      if (!con || con === '--') throw bad('That interface has no NetworkManager connection to edit. Connect it first.', 409);
-      const fam = cfg.family === 6 ? 'ipv6' : 'ipv4';
-      const args = cfg.mode === 'dhcp'
-        ? ['connection', 'modify', con, 'ipv4.method', 'auto', 'ipv4.addresses', '', 'ipv4.gateway', '', 'ipv4.dns', '']
-        : ['connection', 'modify', con, `${fam}.method`, 'manual', `${fam}.addresses`, cfg.address, `${fam}.gateway`, cfg.gateway || '', `${fam}.dns`, (cfg.dns || []).join(' ')];
-      chk(await run('nmcli', args, { timeout: 30000 }), 'nmcli connection modify');
-      chk(await run('nmcli', ['connection', 'up', con], { timeout: 60000 }), 'nmcli connection up');
-      return { backend: 'networkmanager' };
-    }
-    if (b.config === 'netplan') {
-      const wireless = d.caps.wifiIfaces.includes(cfg.device);
-      await applyNetplan((doc) => buildNetplanDoc(doc, { device: cfg.device, wireless, ip: cfg }));
-      return { backend: 'netplan', file: '/etc/netplan/90-uiable.yaml' };
-    }
-    if (b.config === 'systemd-networkd') {
-      const rel = `etc/systemd/network/10-uiable-${cfg.device}.network`;
-      await fsp.mkdir(path.dirname(hostFile(rel)), { recursive: true });
-      await fsp.writeFile(hostFile(rel), buildNetworkdUnit(cfg), { mode: 0o644 });
-      const rl = await run('networkctl', ['reload'], { timeout: 20000 });
-      if (rl.code !== 0) chk(await run('systemctl', ['restart', 'systemd-networkd'], { timeout: 30000 }), 'restart systemd-networkd');
-      await run('networkctl', ['reconfigure', cfg.device], { timeout: 20000 });
-      return { backend: 'systemd-networkd', file: '/' + rel };
-    }
-    throw bad('Static IP / DHCP settings need NetworkManager, netplan or systemd-networkd on the host.', 501);
+    const nmMap = await nmDeviceMap(d);
+    const be = cfgBackendFor(d, nmMap, cfg.device);
+    return guarded(`IP settings for ${cfg.device}`, seconds, async () => {
+      if (be === 'networkmanager') {
+        const con = (nmMap[cfg.device] || {}).connection;
+        if (!con) throw bad('That interface has no NetworkManager connection to edit. Connect it first.', 409);
+        const fam = cfg.family === 6 ? 'ipv6' : 'ipv4';
+        const keys = [`${fam}.method`, `${fam}.addresses`, `${fam}.gateway`, `${fam}.dns`];
+        const restore = await nmSnapshot(con, keys);
+        const args = cfg.mode === 'dhcp'
+          ? ['connection', 'modify', con, 'ipv4.method', 'auto', 'ipv4.addresses', '', 'ipv4.gateway', '', 'ipv4.dns', '']
+          : ['connection', 'modify', con, `${fam}.method`, 'manual', `${fam}.addresses`, cfg.address, `${fam}.gateway`, cfg.gateway || '', `${fam}.dns`, (cfg.dns || []).join(' ')];
+        chk(await run('nmcli', args, { timeout: 30000 }), 'nmcli connection modify');
+        const up = await run('nmcli', ['connection', 'up', con], { timeout: 60000 });
+        if (up.code !== 0) { await restore(); chk(up, 'nmcli connection up'); }
+        return { restore, result: { backend: be } };
+      }
+      if (be === 'netplan') {
+        const wireless = d.caps.wifiIfaces.includes(cfg.device);
+        const restoreFile = await applyNetplan((doc) => buildNetplanDoc(doc, { device: cfg.device, wireless, ip: cfg }));
+        return { restore: async () => { await restoreFile(); await run('netplan', ['apply'], { timeout: 90000 }); }, result: { backend: be, file: '/' + NETPLAN_OWN } };
+      }
+      if (be === 'systemd-networkd') {
+        const rel = `etc/systemd/network/10-uiable-${cfg.device}.network`;
+        const restoreFile = await snapshotFiles([rel]);
+        await fsp.mkdir(path.dirname(hostFile(rel)), { recursive: true });
+        await fsp.writeFile(hostFile(rel), buildNetworkdUnit(cfg), { mode: 0o644 });
+        const reload = async () => {
+          const rl = await run('networkctl', ['reload'], { timeout: 20000 });
+          if (rl.code !== 0) chk(await run('systemctl', ['restart', 'systemd-networkd'], { timeout: 30000 }), 'restart systemd-networkd');
+          await run('networkctl', ['reconfigure', cfg.device], { timeout: 20000 });
+        };
+        await reload();
+        return { restore: async () => { await restoreFile(); await reload(); }, result: { backend: be, file: '/' + rel } };
+      }
+      throw bad('Static IP / DHCP settings need NetworkManager, netplan or systemd-networkd on the host.', 501);
+    });
   }
 
-  return { detect, invalidate, scan, wifiConnect, devices, deviceAction, getIpConfig, setIpConfig, NM_INSTALL_SCRIPT };
+  // ---- Wired / Wi-Fi preference
+  async function setUplink(d, { mode, seconds }) {
+    const plan = planUplink(String(mode || ''));
+    const ov = await overview(d);
+    const nmMap = await nmDeviceMap(d);
+    const targets = ov.interfaces.filter((i) => i.type === 'ethernet' || i.type === 'wifi');
+    if (!targets.length) throw bad('No wired or Wi-Fi interfaces found.', 404);
+    const warnings = [];
+    return guarded(`Wired / Wi-Fi: ${mode}`, seconds, async () => {
+      const restores = [];
+      const prefsBefore = await loadPrefs();
+      const prefs = JSON.parse(JSON.stringify(prefsBefore));
+      prefs.parkedGateways = prefs.parkedGateways || {};
+      const netplanDevs = [], networkdDevs = [];
+      try {
+        for (const i of targets) {
+          const p = plan[i.type];
+          const be = cfgBackendFor(d, nmMap, i.name);
+          if (be === 'networkmanager') {
+            const con = (nmMap[i.name] || {}).connection;
+            if (!con) { warnings.push(`${i.name} has no active NetworkManager connection yet; it will use the default priority.`); continue; }
+            restores.push(await nmSnapshot(con, ['ipv4.route-metric', 'ipv6.route-metric', 'ipv4.never-default', 'ipv6.never-default', 'connection.autoconnect-priority']));
+            chk(await run('nmcli', nmUplinkArgs(con, p), { timeout: 30000 }), `nmcli modify ${con}`);
+            const ra = await run('nmcli', ['device', 'reapply', i.name], { timeout: 30000 });
+            if (ra.code !== 0) chk(await run('nmcli', ['connection', 'up', con], { timeout: 60000 }), `nmcli up ${con}`);
+          } else if (be === 'netplan') netplanDevs.push([i, p]);
+          else if (be === 'systemd-networkd') networkdDevs.push([i, p]);
+          else warnings.push(`${i.name}: no backend can change its priority.`);
+        }
+        if (netplanDevs.length) {
+          const merged = {};
+          for (const [i] of netplanDevs) merged[i.name] = await netplanGet(`network.${i.type === 'wifi' ? 'wifis' : 'ethernets'}.${i.name}`);
+          const restoreFile = await applyNetplan((doc) => {
+            let out = doc;
+            for (const [i, p] of netplanDevs) {
+              const r = applyUplinkToNetplan(out, { device: i.name, wireless: i.type === 'wifi', plan: p, merged: merged[i.name], savedGateway: prefs.parkedGateways[i.name] });
+              out = r.doc;
+              if (r.warning) warnings.push(r.warning);
+              if (r.removedGateway) prefs.parkedGateways[i.name] = r.removedGateway;
+              else if (p.defaultRoute) delete prefs.parkedGateways[i.name];
+            }
+            return out;
+          });
+          restores.push(async () => { await restoreFile(); await run('netplan', ['apply'], { timeout: 90000 }); });
+        }
+        for (const [i, p] of networkdDevs) {
+          const st = await run('networkctl', ['status', i.name, '--no-pager'], { timeout: 10000 });
+          const file = ((st.stdout || '').match(/Network File:\s*(\S+)/) || [])[1];
+          if (!file || file === 'n/a') { warnings.push(`${i.name} has no systemd-networkd config; skipped.`); continue; }
+          const rel = `etc/systemd/network/${path.basename(file)}.d/90-uiable-uplink.conf`;
+          const restoreFile = await snapshotFiles([rel]);
+          await fsp.mkdir(path.dirname(hostFile(rel)), { recursive: true });
+          await fsp.writeFile(hostFile(rel), buildNetworkdUplinkDropin(p), { mode: 0o644 });
+          await run('networkctl', ['reload'], { timeout: 20000 });
+          await run('networkctl', ['reconfigure', i.name], { timeout: 20000 });
+          restores.push(async () => { await restoreFile(); await run('networkctl', ['reload'], { timeout: 20000 }); await run('networkctl', ['reconfigure', i.name], { timeout: 20000 }); });
+        }
+      } catch (e) {
+        for (const r of restores.reverse()) await r().catch(() => {});
+        throw e;
+      }
+      prefs.uplinkMode = mode;
+      await savePrefs(prefs);
+      const restore = async () => { for (const r of restores.slice().reverse()) await r().catch(() => {}); await savePrefs(prefsBefore); };
+      const wired = targets.filter((t) => t.type === 'ethernet'), wl = targets.filter((t) => t.type === 'wifi');
+      const ipOf = (l) => l.map((t) => `${t.name} ${(t.ipv4[0] || 'no IP').split('/')[0]}`).join(', ');
+      const note = mode === 'prefer-wired' || mode === 'prefer-wifi'
+        ? `Both stay up; if the ${mode === 'prefer-wired' ? 'cable is unplugged' : 'Wi-Fi drops'}, traffic fails over automatically. The server's address changes when it fails over (wired: ${ipOf(wired) || 'none'}; Wi-Fi: ${ipOf(wl) || 'none'}). Reserve both addresses on your router (DHCP reservation) or set static IPs so you always know them.`
+        : `Only ${mode === 'wired-only' ? 'wired' : 'Wi-Fi'} carries internet traffic; the other keeps its local address (${ipOf(mode === 'wired-only' ? wl : wired) || 'none'}) but no default route, so there is no automatic failover.`;
+      return { restore, result: { ok: true, mode, warnings, note } };
+    });
+  }
+
+  return {
+    detect, invalidate, scan, wifiConnect, overview, deviceAction, savedWifi, getIpConfig, setIpConfig, setUplink,
+    confirmPending, revertPending, pendingInfo, NM_INSTALL_SCRIPT,
+  };
 }
 
 module.exports = {
   create, splitTerse, stripAnsi, dedupeNetworks, parseNmcliWifi, parseIwctlStations, parseIwctlShow, parseIwctlNetworks,
   parseWpaScanResults, parseKv, parseIwScan, unescapeSsid, wpaSecurity, freqToChannel, dbmToPercent, wpaPsk, validatePassphrase,
-  scrub, validateIpConfig, buildNetworkdUnit, buildNetplanDoc, parseProbe, chooseBackends, describe, classifyHost, pickPkg,
+  scrub, validateIpConfig, buildNetworkdUnit, buildNetplanDoc, parseProbe,
+  parseIpAddrJson, parseDefaultRoutes, parseResolvectlDns, parseIwLink, parseIwctlKnown, parseWpaNetworks, ifaceType, ifaceStatus, parseRfkill, classifyWifiFailure,
+  planUplink, inferUplinkMode, netplanDefaultSource, applyUplinkToNetplan, buildNetworkdUplinkDropin, nmUplinkArgs, UPLINK_MODES, chooseBackends, describe, classifyHost, pickPkg,
   nmUnmanagedConf, NM_INSTALL_SCRIPT, NM_UIABLE_CONF, PROBE,
 };

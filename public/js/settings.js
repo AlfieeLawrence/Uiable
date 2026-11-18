@@ -48,10 +48,63 @@ Settings.general = async (b) => {
 const signalBars = (s) => `<span class="signal" title="${s}%">${[20, 45, 65, 85].map((t, i) => `<i class="${s >= t ? 'on' : ''}" style="height:${(i + 1) * 4}px"></i>`).join('')}</span>`;
 
 Settings.network = async (b) => {
-  b.innerHTML = `<div data-nmbox></div><div data-wifi class="card section"><div class="card-title">${ICON.wifi} Wi-Fi <span class="spacer"></span><button class="sm" data-scan>${ICON.refresh} Scan</button></div><div data-wlist><span class="spinner"></span></div></div>
+  b.innerHTML = `<div data-conn></div><div data-nmbox></div><div data-wifi class="card section"><div class="card-title">${ICON.wifi} Wi-Fi <span class="spacer"></span><button class="sm" data-scan>${ICON.refresh} Scan</button></div><div data-wlist><span class="spinner"></span></div></div>
     <div class="card section"><div class="card-title">${ICON.globe} Interfaces &amp; IP addresses</div><div data-ifs><span class="spinner"></span></div></div>`;
   let net = null;
   const BK = { networkmanager: 'NetworkManager', iwd: 'iwd', wpa_supplicant: 'wpa_supplicant', netplan: 'netplan', 'systemd-networkd': 'systemd-networkd', ip: 'ip link', iw: 'iw' };
+  const MODES = [['prefer-wired', 'Prefer wired (fail over to Wi-Fi)'], ['prefer-wifi', 'Prefer Wi-Fi (fail over to wired)'], ['wired-only', 'Wired only'], ['wifi-only', 'Wi-Fi only']];
+  const TYPE = { ethernet: 'wired', wifi: 'Wi-Fi', virtual: 'virtual', loopback: 'loopback' };
+  const ip4 = (i) => (i.ipv4 || [])[0] || '';
+  const chipCls = (st) => (st === 'connected' || st === 'active' ? 'ok' : st === 'idle' || st === 'loopback' ? 'plain' : '');
+
+  // Guarded changes come back with { pending: { token, seconds } }: ask to keep, else the server reverts.
+  const keepDialog = async (pending) => {
+    if (!pending || !pending.token) return;
+    let left = pending.seconds || pending.secondsLeft || 60, timer;
+    const r = await modal({
+      title: 'Keep these network settings?', dismissable: false,
+      body: `<p><b>${esc(pending.label || 'Network change')}</b> was applied. If you can see this, the connection still works.</p><p class="muted">Reverting automatically in <b data-left>${left}</b>s unless you keep it.</p>`,
+      onOpen: (m, close) => { timer = setInterval(() => { left -= 1; const el = $('[data-left]', m); if (el) el.textContent = Math.max(0, left); if (left <= 0) { clearInterval(timer); close(null); } }, 1000); return () => clearInterval(timer); },
+      buttons: [{ label: 'Revert now', value: 'revert' }, { label: 'Keep', cls: 'primary', value: 'keep' }],
+    });
+    clearInterval(timer);
+    if (r === 'keep') await act(null, () => POST('/system/network/pending/confirm', { token: pending.token }), 'Kept');
+    else if (r === 'revert') await act(null, () => POST('/system/network/pending/revert', { token: pending.token }), 'Reverted');
+    else toast('Not confirmed: the previous settings were restored.');
+    setTimeout(() => { loadNet(true); loadWifi(); }, 1500);
+  };
+  const guardedPost = async (url, body, okMsg) => {
+    try {
+      const out = await POST(url, Object.assign({ seconds: 60 }, body || {}));
+      if (out && out.pending) await keepDialog(out.pending); else if (okMsg) toast(okMsg);
+      return out;
+    } catch (e) {
+      toastErr(new Error(`${e.message}${/fetch|network|Failed/i.test(e.message) ? ' — if the connection dropped, the change reverts by itself within 60s.' : ''}`));
+      return null;
+    }
+  };
+
+  const renderConn = (n) => {
+    const box = $('[data-conn]', b);
+    const u = n.uplink || {};
+    const phys = (n.interfaces || []).filter((i) => i.type === 'ethernet' || i.type === 'wifi');
+    const p = u.primary;
+    const pi = p && phys.find((i) => i.name === p.dev);
+    box.innerHTML = `<div class="card section"><div class="card-title">${ICON.globe} Connection</div>
+      ${p ? `<p style="margin-top:0">Online via <b class="mono">${esc(p.dev)}</b> (${esc(TYPE[p.type] || p.type || '?')}${pi && pi.wifi ? ' · ' + esc(pi.wifi.ssid) : ''}) · IP <b class="mono">${esc((p.ip || '').split('/')[0] || 'none')}</b> · gateway <span class="mono">${esc(p.gateway || 'none')}</span></p>` : '<div class="notice">No default route: this server has no internet uplink right now.</div>'}
+      <table><thead><tr><th>Interface</th><th>Status</th><th>IP</th><th class="hide-sm">Gateway</th><th class="hide-sm">DNS</th></tr></thead><tbody>${phys.map((i) => `<tr>
+        <td class="mono"><b>${esc(i.name)}</b> ${i.primary ? '<span class="chip ok">primary</span>' : ''}<div class="muted small">${esc(TYPE[i.type])}${i.metric != null ? ' · metric ' + esc(i.metric) : ''}</div></td>
+        <td><span class="chip ${chipCls(i.state)}">${esc(i.label)}</span>${i.wifi ? `<div class="row small" style="gap:6px;margin-top:4px">${i.wifi.signal != null ? signalBars(i.wifi.signal) : ''} ${esc(i.wifi.ssid)}${i.wifi.signal != null ? ` · ${esc(i.wifi.signal)}%` : ''}</div>` : ''}</td>
+        <td class="mono small">${esc(ip4(i) || 'none')}${ip4(i) ? `<div class="muted">${i.dhcp ? 'DHCP' : 'static'}</div>` : ''}</td>
+        <td class="mono small hide-sm">${esc(i.gateway || '—')}</td><td class="mono small hide-sm">${esc((i.dns || []).join(', ') || (n.dns || []).join(', ') || '—')}</td></tr>`).join('')}</tbody></table>
+      ${u.canSet && u.wired.length && u.wireless.length ? `<div class="row wrap" style="margin-top:14px;gap:8px"><label class="small"><b>Wired / Wi-Fi</b></label>
+        <select data-uplink style="max-width:320px">${MODES.map(([v, l]) => `<option value="${v}" ${u.mode === v ? 'selected' : ''}>${esc(l)}</option>`).join('')}</select>
+        <button class="primary sm" data-setuplink>Apply</button>${u.modeStored ? '' : '<span class="muted small">(current: detected from routes)</span>'}</div>
+        <p class="muted small">With a "prefer" option both connections stay up, so unplugging the cable (or losing Wi-Fi) fails over automatically. The server's IP address changes when it fails over — reserve both addresses on your router (DHCP reservation) or set static IPs with <b>IP settings…</b>.</p>`
+        : (u.wired && u.wired.length && u.wireless && u.wireless.length ? '<p class="muted small">Wired / Wi-Fi preference needs NetworkManager, netplan or systemd-networkd on the host.</p>' : '')}
+    </div>`;
+  };
+
   const renderBackend = (n) => {
     const box = $('[data-nmbox]', b);
     const bk = n.backend || {};
@@ -66,23 +119,22 @@ Settings.network = async (b) => {
         ? `<div class="row wrap" style="margin-top:10px"><button class="primary" data-nminstall>Install NetworkManager</button><span class="muted small">Uses ${esc(inst.pkg)} on ${esc(inst.osName || 'the host')} for full Wi-Fi and connection management.</span></div>`
         : (inst.reason ? `<p class="muted small">NetworkManager can't be installed from Uiable: ${esc(inst.reason)}</p>` : '')) : ''}</div>`;
   };
+
   const loadNet = async (refresh) => {
     try {
       const n = net = await GET('/system/network' + (refresh ? '?refresh=1' : ''));
+      renderConn(n);
       renderBackend(n);
       const bk = n.backend || {};
-      const devs = Object.fromEntries((n.devices || []).map((d) => [d.device, d]));
-      const canLink = !!bk.link, canCfg = !!bk.config;
       $('[data-ifs]', b).innerHTML = `${bk.readOnly ? `<p class="muted small" style="margin-top:0">Read-only: no supported network backend on this host.</p>` : ''}
         <table><thead><tr><th>Interface</th><th>State</th><th>Addresses</th><th class="hide-sm">MAC</th><th></th></tr></thead><tbody>${n.interfaces.map((i) => {
-          const d = devs[i.name];
-          const ctl = d && d.type !== 'loopback';
-          return `<tr><td class="mono"><b>${esc(i.name)}</b>${d ? `<div class="muted small">${esc(d.type)}${d.connection ? ' · ' + esc(d.connection) : ''}</div>` : ''}</td>
-          <td><span class="chip ${/up|connected/i.test(i.state) || (d && d.state === 'connected') ? 'ok' : ''}">${esc(d ? d.state : (i.state || '').toLowerCase())}</span></td>
+          const on = i.state === 'connected' || i.state === 'no-ip';
+          return `<tr><td class="mono"><b>${esc(i.name)}</b><div class="muted small">${esc(TYPE[i.type] || i.type)}${i.connection ? ' · ' + esc(i.connection) : ''}${i.managedBy && i.managedBy !== 'networkmanager' && n.networkManager ? ' · ' + esc(BK[i.managedBy] || i.managedBy) : ''}</div></td>
+          <td><span class="chip ${chipCls(i.state)}">${esc(i.label || i.state)}</span></td>
           <td class="mono small">${i.addresses.map(esc).join('<br>') || '<span class="muted">none</span>'}</td><td class="mono muted small hide-sm">${esc(i.mac || '')}</td>
-          <td>${ctl ? `<div class="actions">${canLink ? (d.state === 'connected' || d.state === 'up' ? `<button class="sm" data-dev="${esc(i.name)}" data-act="disconnect">Disconnect</button>` : `<button class="sm" data-dev="${esc(i.name)}" data-act="connect">Connect</button>`) : ''}${canCfg && d.type !== 'virtual' ? `<button class="sm" data-ipcfg="${esc(i.name)}">IP settings…</button>` : ''}</div>` : ''}</td></tr>`;
-        }).join('')}</tbody></table>
-        <div class="kv small" style="margin-top:14px"><div>Default route</div><div class="mono">${esc(n.defaultRoute || 'none')}</div><div>DNS servers</div><div class="mono">${esc((n.dns || []).join(', ') || 'unknown')}</div></div>`;
+          <td><div class="actions">${i.canLink ? (on || (i.type === 'ethernet' && i.state === 'no-cable') ? `<button class="sm" data-dev="${esc(i.name)}" data-act="disconnect">Disconnect</button>` : `<button class="sm" data-dev="${esc(i.name)}" data-act="connect">Connect</button>`) : ''}${i.canConfig ? `<button class="sm" data-ipcfg="${esc(i.name)}">IP settings…</button>` : ''}</div></td></tr>`;
+        }).join('')}</tbody></table>`;
+      if (n.pending && !document.querySelector('.modal-bg')) keepDialog(n.pending);
     } catch (e) { $('[data-ifs]', b).innerHTML = `<div class="notice">${esc(e.message)}</div>`; }
   };
   const hiddenRow = `<div class="list-item"><div class="grow muted">Hidden network?</div><button class="sm" data-hidden>Join other network…</button></div>`;
@@ -99,27 +151,57 @@ Settings.network = async (b) => {
   };
   const join = async (ssid, security, device, hidden) => {
     const fields = hidden ? [{ name: 'ssid', label: 'Network name (SSID)' }, { name: 'password', label: 'Password (leave empty if open)', type: 'password' }] : (security && security !== '--' ? [{ name: 'password', label: 'Password', type: 'password' }] : []);
-    const r = fields.length ? await formDlg(`Connect to ${hidden ? 'hidden network' : ssid}`, fields, 'Connect', { intro: 'If you are connected to this server over the network you are changing, your SSH session may drop.' }) : (await confirmDlg(`Connect to ${esc(ssid)}?`, 'This is an open network.', { okLabel: 'Connect' })) && {};
+    const r = fields.length ? await formDlg(`Connect to ${hidden ? 'hidden network' : ssid}`, fields, 'Connect', { intro: 'Uiable waits until the Wi-Fi is joined and has an IP address (up to ~40s) and tells you exactly what went wrong if not.' }) : (await confirmDlg(`Connect to ${esc(ssid)}?`, 'This is an open network.', { okLabel: 'Connect' })) && {};
     if (!r) return;
-    const out = await act(null, () => POST('/system/wifi/connect', { ssid: hidden ? r.ssid : ssid, password: r.password || '', device, hidden: !!hidden }), 'Connected');
-    if (out) { if (out.persisted === false && out.output) toast(out.output); loadWifi(); loadNet(); }
+    const wl = $('[data-wlist]', b); wl.innerHTML = `<span class="spinner"></span> <span class="muted">Connecting to ${esc(hidden ? r.ssid : ssid)} and waiting for an IP address…</span>`;
+    const out = await act(null, () => POST('/system/wifi/connect', { ssid: hidden ? r.ssid : ssid, password: r.password || '', device, hidden: !!hidden }));
+    if (out) toast(out.output || 'Connected');
+    loadWifi(); loadNet(true);
+  };
+  // Wi-Fi interface without a saved network: pick one (SSID + password) instead of a bare "connect".
+  const pickWifi = async (dev, why) => {
+    const r = await modal({
+      title: 'Choose a Wi-Fi network', wide: true,
+      body: `<p class="muted small" style="margin-top:0">${esc(why || '')} Interface <b class="mono">${esc(dev)}</b>.</p><div data-pick><span class="spinner"></span> <span class="muted">Scanning…</span></div>`,
+      buttons: [{ label: 'Join other network…', value: { hidden: true } }, { label: 'Cancel', value: null }],
+      onOpen: (m, close) => {
+        const box = $('[data-pick]', m);
+        GET('/system/wifi?rescan=1').then((w) => {
+          if (!w.available) { box.innerHTML = `<div class="notice">${esc(w.message || 'Wi-Fi is not available.')}</div>`; return; }
+          const list = (w.networks || []).filter((n) => !n.device || n.device === dev);
+          box.innerHTML = list.length ? `<div class="wifi-list">${list.map((n, i) => `<div class="list-item">${signalBars(n.signal)}<div class="grow" style="min-width:0"><b class="ellipsis" style="display:block">${esc(n.ssid)}</b><div class="muted small">${esc(n.security || 'Open')}${n.channel ? ' · ch ' + esc(n.channel) : ''}</div></div><button class="sm primary" data-pk="${i}">Connect</button></div>`).join('')}</div>`
+            : '<div class="empty">No networks found. Use “Join other network…” for a hidden one.</div>';
+          box.onclick = (e) => { const k = e.target.closest('[data-pk]'); if (k) close({ net: list[+k.dataset.pk] }); };
+        }).catch((e) => { box.innerHTML = `<div class="notice">${esc(e.message)}</div>`; });
+      },
+    });
+    if (!r) return;
+    if (r.hidden) return join('', '', dev, true);
+    return join(r.net.ssid, r.net.security, dev);
   };
   const ipSettings = async (dev) => {
     let cur = {};
     try { cur = await GET('/system/network/config/' + encodeURIComponent(dev)); } catch (_) {}
     const i = (net.interfaces || []).find((x) => x.name === dev) || {};
-    const v4 = (i.addresses || []).find((a) => !a.includes(':')) || '';
-    const via = BK[(net.backend || {}).config] || 'the host';
+    const via = BK[cur.backend] || 'the host';
     const r = await formDlg(`IP settings · ${dev}`, [
-      { name: 'mode', label: 'Mode', type: 'select', options: ['dhcp', 'static'], value: cur.mode || 'dhcp' },
-      { name: 'address', label: 'Address (CIDR, static only)', value: cur.address || v4, placeholder: '192.168.1.50/24' },
-      { name: 'gateway', label: 'Gateway (static only)', value: cur.gateway || '', placeholder: '192.168.1.1' },
-      { name: 'dns', label: 'DNS servers (comma separated, static only)', value: cur.dns || '', placeholder: '1.1.1.1, 9.9.9.9' },
-    ], 'Apply', { intro: `Saved with ${esc(via)}${cur.managed === false ? ' (Uiable will add its own config file; your existing files are left untouched)' : ''}. If you reach this server through <b class="mono">${esc(dev)}</b>, a wrong address will cut you off.` });
+      { name: 'mode', label: 'Mode', type: 'select', options: ['dhcp', 'static'], value: cur.mode || (i.dhcp === false && ip4(i) ? 'static' : 'dhcp') },
+      { name: 'address', label: 'Address (CIDR, static only)', value: cur.address || ip4(i), placeholder: '192.168.1.50/24' },
+      { name: 'gateway', label: 'Gateway (static only)', value: cur.gateway || i.gateway || '', placeholder: '192.168.1.1' },
+      { name: 'dns', label: 'DNS servers (comma separated, static only)', value: cur.dns || (i.dns || []).join(', '), placeholder: '1.1.1.1, 9.9.9.9' },
+    ], 'Apply', { intro: `Saved with ${esc(via)}${cur.managed === false ? ' (Uiable adds its own config file; your existing files are left untouched)' : ''}. You'll be asked to keep the change; if this page can't reach the server afterwards, it reverts automatically after 60s.` });
     if (!r) return;
-    if (!(await confirmDlg(`Apply IP settings to ${esc(dev)}?`, 'The interface is reconfigured immediately and the connection may drop briefly.', { okLabel: 'Apply', danger: true }))) return;
-    const ok = await act(null, () => POST('/system/network/config', Object.assign({ device: dev }, r)), 'IP settings applied');
-    if (ok) loadNet(true);
+    if (!(await confirmDlg(`Apply IP settings to ${esc(dev)}?`, `The interface is reconfigured now${i.primary ? ' and it is the one this server is reached through' : ''}. If you lose access, it reverts by itself within 60 seconds.`, { okLabel: 'Apply', danger: !!i.primary }))) return;
+    await guardedPost('/system/network/config', Object.assign({ device: dev }, r), 'IP settings applied');
+    loadNet(true);
+  };
+  const setUplink = async () => {
+    const mode = $('[data-uplink]', b).value;
+    const label = (MODES.find((m) => m[0] === mode) || [])[1];
+    if (!(await confirmDlg(`Switch to "${esc(label)}"?`, 'Route priorities are changed now; the connection may drop for a few seconds. If this page can\'t reach the server afterwards, it reverts automatically within 60 seconds.', { okLabel: 'Apply' }))) return;
+    const out = await guardedPost('/system/network/uplink', { mode });
+    if (out) { (out.warnings || []).forEach((w) => toast(w, true)); if (out.note) toast(out.note); }
+    loadNet(true);
   };
   const installNm = async () => {
     const inst = (net && net.nmInstall) || {};
@@ -131,20 +213,44 @@ Settings.network = async (b) => {
     if (!r) return;
     if (!r.ack) { toastErr(new Error('Tick the box to confirm you understand the connection may drop.')); return; }
     const out = await act(null, () => POST('/system/network/nm-install', { mode: /^All/.test(r.mode) ? 'all' : 'wifi-only' }));
-    if (out && out.job) await watchJob(out.job, 'Installing NetworkManager');
-    loadNet(true); loadWifi();
+    if (out && out.job) {
+      let j = await watchJob(out.job, 'Installing NetworkManager');
+      // Closing the log early doesn't stop the install: keep waiting so the page switches over when it's done.
+      while (j && j.state === 'running') { await new Promise((res) => setTimeout(res, 2000)); j = await GET('/jobs/' + out.job.id).catch(() => null); }
+      if (j && j.state === 'failed') toastErr(new Error('NetworkManager install failed — open it again to see the log.'));
+      // NetworkManager takes a few seconds to pick up devices after starting: re-detect until it shows.
+      for (let k = 0; k < 8; k++) {
+        await loadNet(true);
+        if (!b.isConnected || (net && net.networkManager) || (j && j.state === 'failed')) break;
+        await new Promise((res) => setTimeout(res, 2500));
+      }
+      if (net && net.networkManager) toast('NetworkManager is running — network management switched over.');
+    } else loadNet(true);
+    loadWifi();
   };
   b.onclick = async (e) => {
     if (e.target.closest('[data-nminstall]')) return installNm();
+    if (e.target.closest('[data-setuplink]')) return setUplink();
     if (e.target.closest('[data-scan]')) return loadWifi(true);
     if (e.target.closest('[data-hidden]')) return join('', '', '', true);
     const ipc = e.target.closest('[data-ipcfg]'); if (ipc) return ipSettings(ipc.dataset.ipcfg);
     const j = e.target.closest('[data-join]'); if (j) return join(j.dataset.join, j.dataset.sec, j.dataset.wdev);
     const d = e.target.closest('[data-dev]');
     if (d) {
-      if (d.dataset.act === 'disconnect' && !(await confirmDlg(`Disconnect ${esc(d.dataset.dev)}?`, 'If this is the interface your SSH tunnel uses, you will lose access to the server.', { okLabel: 'Disconnect', danger: true }))) return;
-      await act(d, () => POST(`/system/network/device/${encodeURIComponent(d.dataset.dev)}/${d.dataset.act}`), 'Done');
-      loadNet(); loadWifi();
+      const dev = d.dataset.dev;
+      if (d.dataset.act === 'disconnect') {
+        const i = ((net && net.interfaces) || []).find((x) => x.name === dev) || {};
+        if (!(await confirmDlg(`Disconnect ${esc(dev)}?`, `${i.primary ? '<b>This is the interface the server is reached through.</b> ' : ''}If you lose access, it reconnects by itself within 60 seconds unless you confirm.`, { okLabel: 'Disconnect', danger: true }))) return;
+        await guardedPost(`/system/network/device/${encodeURIComponent(dev)}/disconnect`, {}, 'Disconnected');
+      } else {
+        d.disabled = true;
+        try { await POST(`/system/network/device/${encodeURIComponent(dev)}/connect`); toast(`Connected ${dev}`); }
+        catch (err) {
+          if (err.data && err.data.reason === 'needs-ssid') { if (d.isConnected) d.disabled = false; return pickWifi(dev, err.message); }
+          toastErr(err);
+        } finally { if (d.isConnected) d.disabled = false; }
+      }
+      loadNet(true); loadWifi();
     }
   };
   loadNet(); loadWifi();

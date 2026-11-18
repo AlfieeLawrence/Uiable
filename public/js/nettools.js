@@ -5,7 +5,7 @@ Pages['network-tools'] = (el) => {
   const body = $('[data-body]', el);
   const show = () => {
     if (tab === 'ping') {
-      body.innerHTML = `<div class="card"><div class="row wrap"><input data-host placeholder="host or IP" style="max-width:280px"><input data-n type="number" value="4" min="1" max="20" style="width:80px"><button class="primary" data-go>Ping</button></div><pre class="out" data-out style="margin-top:12px;min-height:160px"></pre></div>`;
+      body.innerHTML = `<div class="card"><div class="row wrap"><input data-host placeholder="host or IP" style="max-width:280px"><input data-n type="number" value="4" min="1" max="20" style="width:80px"><button class="primary" data-go>Ping</button></div><pre class="out log-out" data-out style="margin-top:12px;min-height:160px;max-height:70vh;resize:vertical"></pre></div>`;
       $('[data-go]', body).onclick = async (e) => { const r = await act(e.target, () => POST('/nettools/ping', { host: $('[data-host]', body).value, count: +$('[data-n]', body).value })); if (r) $('[data-out]', body).textContent = r.output; };
     } else if (tab === 'traceroute') {
       body.innerHTML = `<div class="card"><div class="row"><input data-host placeholder="host or IP" style="max-width:280px"><button class="primary" data-go>Trace</button></div><p class="muted small">Runs as a background job so you can watch the hops arrive.</p></div>`;

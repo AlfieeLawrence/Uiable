@@ -5,7 +5,7 @@ Pages.cron = (el) => {
   const body = $('[data-body]', el);
   const show = async () => {
     if (tab === 'user') {
-      body.innerHTML = `<div class="card"><div class="row"><input data-user value="root" style="max-width:160px"><button data-load>Load</button><div class="spacer"></div>
+      body.innerHTML = `<div class="card"><div class="row wrap"><input data-user value="root" style="max-width:160px"><button data-load>Load</button><div class="spacer"></div>
         <select data-preset style="width:auto"><option value="">Insert preset…</option></select><button data-next>Next runs</button></div>
         <textarea class="editor" data-text style="min-height:40vh;margin-top:12px" spellcheck="false"></textarea>
         <div class="row" style="margin-top:12px"><button class="primary" data-save>Save crontab</button><span class="muted small" data-hint></span></div></div>`;

@@ -69,8 +69,8 @@ Pages.docker = (el, params) => {
   function showLogs(id, name) {
     let t = null;
     modal({
-      title: `Logs · ${name}`, full: true,
-      body: `<div class="toolbar"><select data-tail style="width:auto"><option>100</option><option selected>500</option><option>2000</option></select><label class="row small"><input type="checkbox" data-follow checked> Follow</label><label class="row small"><input type="checkbox" data-ts> Timestamps</label><div class="spacer"></div><button class="sm" data-dl>${ICON.download} Save</button></div><pre class="out" data-logs style="height:calc(100% - 50px);overflow:auto">Loading…</pre>`,
+      title: `Logs · ${name}`, full: true, log: true,
+      body: `<div class="toolbar"><select data-tail style="width:auto"><option>100</option><option selected>500</option><option>2000</option></select><label class="row small"><input type="checkbox" data-follow checked> Follow</label><label class="row small"><input type="checkbox" data-ts> Timestamps</label><div class="spacer"></div><button class="sm" data-dl>${ICON.download} Save</button></div><pre class="out log-out" data-logs>Loading…</pre>`,
       onOpen: (m) => {
         const pre = $('[data-logs]', m); let raw = '';
         const fetchLogs = async () => {
@@ -95,7 +95,7 @@ Pages.docker = (el, params) => {
     const hist = { cpu: [], mem: [] };
     modal({
       title: `Stats · ${name}`, wide: true,
-      body: `<div class="grid cols-2" style="grid-template-columns:1fr 1fr"><div class="card"><div class="label muted small">CPU</div><div class="big" style="font-size:24px;font-weight:650" data-s="cpu">…</div><canvas class="spark" data-s="cspark"></canvas></div>
+      body: `<div class="grid stats-pair"><div class="card"><div class="label muted small">CPU</div><div class="big" style="font-size:24px;font-weight:650" data-s="cpu">…</div><canvas class="spark" data-s="cspark"></canvas></div>
         <div class="card"><div class="label muted small">MEMORY</div><div class="big" style="font-size:24px;font-weight:650" data-s="mem">…</div><div class="muted small" data-s="memsub"></div><canvas class="spark" data-s="mspark"></canvas></div></div>
         <div class="kv" style="margin-top:16px" data-s="kv"></div>`,
       onOpen: (m) => {

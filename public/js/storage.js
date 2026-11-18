@@ -26,8 +26,7 @@ Pages.storage = (el, params) => {
             </tbody></table></div>`}
         </div>
       </div>`;
-      const box = raidBox();
-      if (box && !box._raidBound) {
+      if (box.isConnected && !box._raidBound) {
         box._raidBound = true;
         box.addEventListener('click', async (ev) => {
           const stBtn = ev.target.closest('[data-md-start]');

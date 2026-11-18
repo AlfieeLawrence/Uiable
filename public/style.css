@@ -60,7 +60,7 @@ h1 { font-size: 30px; } h2 { font-size: 20px; } h3 { font-size: 15px; }
 /* cards */
 .card { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); padding: 20px; box-shadow: var(--shadow); }
 .card.flush { padding: 0; overflow: hidden; }
-.card-title { display: flex; align-items: center; gap: 8px; margin-bottom: 14px; font-weight: 600; }
+.card-title { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; font-weight: 600; min-width: 0; }
 .card-title .muted { font-weight: 400; }
 .card-title svg { width: 18px; height: 18px; color: var(--accent); flex-shrink: 0; }
 .grid { display: grid; gap: 16px; }
@@ -249,7 +249,7 @@ table .chip, .list-item .chip, .row .chip { min-width: 72px; }
 .fname .link { color: var(--muted); font-size: 12px; }
 .dropzone { position: relative; }
 .dropzone.over::after { content: "Drop files or folders to upload"; position: absolute; inset: 0; border: 2px dashed var(--accent); border-radius: var(--radius); background: rgba(124,92,255,.12); display: grid; place-items: center; font-size: 18px; font-weight: 600; z-index: 5; }
-.progress { position: fixed; right: 20px; bottom: 96px; width: 340px; z-index: 80; }
+.progress { position: fixed; right: 20px; bottom: 96px; width: min(340px, calc(100vw - 40px)); z-index: 80; }
 .ctx { position: fixed; z-index: 90; min-width: 180px; background: var(--card-solid); border: 1px solid var(--border); border-radius: 14px; box-shadow: var(--shadow); padding: 6px; }
 .ctx button { width: 100%; border: 0; background: transparent; border-radius: 9px; justify-content: flex-start; padding: 8px 10px; }
 .ctx button:hover { background: var(--input); }
@@ -260,11 +260,11 @@ table .chip, .list-item .chip, .row .chip { min-width: 72px; }
 .term-tab { display: inline-flex; align-items: center; gap: 8px; padding: 6px 8px 6px 14px; border-radius: 12px; background: var(--input); border: 1px solid var(--border); cursor: pointer; }
 .term-tab.active { background: var(--card-solid); border-color: var(--accent); }
 .term-tab .x { border: 0; padding: 2px 6px; background: transparent; border-radius: 6px; }
-.term-box { height: calc(100vh - 260px); min-height: 300px; padding: 10px; background: #0d0f17; border-radius: var(--radius); border: 1px solid var(--border); }
+.term-box { height: calc(100vh - 260px); height: calc(100dvh - 260px); min-height: 300px; padding: 10px; background: #0d0f17; border-radius: var(--radius); border: 1px solid var(--border); }
 .term-box > div { height: 100%; } .term-box .xterm { height: 100%; }
 
 /* settings */
-.settings { display: grid; grid-template-columns: 220px 1fr; gap: 20px; align-items: start; }
+.settings { display: grid; grid-template-columns: 220px minmax(0, 1fr); gap: 20px; align-items: start; }
 .settings nav { display: flex; flex-direction: column; gap: 2px; padding: 10px; position: sticky; top: 20px; }
 .settings nav a { color: var(--text); padding: 9px 12px; border-radius: 12px; display: flex; gap: 10px; align-items: center; }
 .settings nav a svg { width: 18px; height: 18px; color: var(--muted); }
@@ -277,16 +277,16 @@ table .chip, .list-item .chip, .row .chip { min-width: 72px; }
 .notice.info { background: rgba(124,92,255,.10); border-color: rgba(124,92,255,.3); }
 
 /* modal & toast */
-.modal-bg { position: fixed; inset: 0; background: rgba(5,7,12,.62); display: grid; place-items: center; z-index: 100; padding: 20px; animation: fade .15s; }
-.modal { width: 100%; max-width: 460px; max-height: calc(100vh - 40px); display: flex; flex-direction: column; background: var(--card-solid); border-radius: var(--radius); border: 1px solid var(--border); box-shadow: 0 30px 80px rgba(0,0,0,.4); animation: pop .18s; }
-.modal.wide { max-width: 960px; } .modal.full { max-width: 1200px; height: calc(100vh - 40px); }
+.modal-bg { position: fixed; inset: 0; background: rgba(5,7,12,.62); display: grid; grid-template-columns: minmax(0, 1fr); place-items: center; z-index: 100; padding: 20px; animation: fade .15s; }
+.modal { width: 100%; min-width: 0; max-width: 460px; max-height: calc(100vh - 40px); max-height: calc(100dvh - 40px); display: flex; flex-direction: column; background: var(--card-solid); border-radius: var(--radius); border: 1px solid var(--border); box-shadow: 0 30px 80px rgba(0,0,0,.4); animation: pop .18s; }
+.modal.wide { max-width: 960px; } .modal.full { max-width: 1200px; height: calc(100vh - 40px); height: calc(100dvh - 40px); }
 .modal header { padding: 18px 20px 6px; display: flex; align-items: center; gap: 10px; }
-.modal .body { padding: 12px 20px; overflow: auto; flex: 1; }
-.modal footer { padding: 12px 20px 18px; display: flex; gap: 8px; justify-content: flex-end; }
-.modal pre, pre.out { margin: 0; font-family: var(--mono); font-size: 12px; white-space: pre-wrap; word-break: break-all; background: var(--input); padding: 12px; border-radius: 12px; }
+.modal .body { padding: 12px 20px; overflow: auto; flex: 1 1 auto; min-height: 0; overflow-wrap: anywhere; }
+.modal footer { padding: 12px 20px 18px; display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; }
+.modal pre, pre.out { margin: 0; font-family: var(--mono); font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; word-break: normal; background: var(--input); padding: 12px; border-radius: 12px; overflow: auto; line-height: 1.45; }
 .modal textarea.editor { font-family: var(--mono); font-size: 13px; height: 100%; min-height: 60vh; resize: none; tab-size: 4; white-space: pre; line-height: 1.5; }
 #toasts { position: fixed; top: 18px; right: 18px; display: flex; flex-direction: column; gap: 8px; z-index: 200; }
-.toast { background: var(--card-solid); border: 1px solid var(--border); border-left: 4px solid var(--ok); padding: 11px 16px; border-radius: 12px; box-shadow: var(--shadow); max-width: 380px; animation: pop .2s; overflow-wrap: anywhere; }
+.toast { background: var(--card-solid); border: 1px solid var(--border); border-left: 4px solid var(--ok); padding: 11px 16px; border-radius: 12px; box-shadow: var(--shadow); max-width: min(380px, calc(100vw - 36px)); animation: pop .2s; overflow-wrap: anywhere; }
 .toast.err { border-left-color: var(--danger); }
 .spinner { width: 18px; height: 18px; border: 2px solid var(--track); border-top-color: var(--accent); border-radius: 50%; animation: spin .8s linear infinite; display: inline-block; }
 .empty { padding: 40px; text-align: center; color: var(--muted); }
@@ -477,3 +477,55 @@ table .chip, .list-item .chip, .row .chip { min-width: 72px; }
 .split-menu { position: absolute; right: 0; bottom: calc(100% + 6px); background: var(--card, #161922); border: 1px solid var(--border, #2a3142); border-radius: 8px; box-shadow: 0 10px 28px rgba(0,0,0,.45); z-index: 50; min-width: 150px; padding: 4px; display: flex; flex-direction: column; gap: 2px; }
 .split-menu.hidden { display: none; }
 .split-menu button { width: 100%; justify-content: flex-start; }
+
+/* ---- layout polish (1.2.5) ------------------------------------------------ */
+/* Tables outside .table-wrap get a .table-scroll wrapper (core.js) so they scroll inside the card. */
+.table-scroll { max-width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; scrollbar-width: thin; }
+.settings > * { min-width: 0; }
+.settings [data-sec-body] > .card, .settings [data-sec-body] .section { min-width: 0; }
+.ctr .grow b.ellipsis, .ctr .grow > b { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ok-text { color: var(--ok); font-weight: 600; } .err-text { color: var(--danger); font-weight: 600; }
+
+/* Log / job output: grows with its content up to the space the dialog has, then scrolls itself. */
+.modal.has-log { max-width: 1100px; }
+.modal.has-log .body { display: flex; flex-direction: column; gap: 10px; overflow: hidden; }
+.modal.has-log .body > .toolbar { margin-bottom: 0; flex: none; }
+.modal.has-log .log-out, pre.out.log-out { flex: 1 1 auto; min-height: 200px; overflow: auto; }
+.modal.has-log .log-out { max-height: none; }
+.job-status { flex: none; gap: 8px; min-height: 22px; }
+.job-status .spinner { width: 14px; height: 14px; }
+.page-log { height: calc(100vh - 230px); height: calc(100dvh - 230px); min-height: 260px; resize: vertical; }
+.stats-pair { grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
+
+/* Network page: long SSIDs / v6 addresses wrap instead of widening the table */
+[data-conn] td:first-child, [data-ifs] td:first-child, [data-conn] td.mono, [data-ifs] td.mono { white-space: nowrap; }
+[data-conn] td .row { flex-wrap: wrap; max-width: 240px; }
+[data-ifs] .actions, [data-conn] .actions { flex-wrap: wrap; }
+.wifi-list { max-height: min(60vh, 520px); overflow: auto; }
+[data-wlist] .list-item b, .wifi-list .list-item b { overflow-wrap: anywhere; }
+
+@media (max-width: 800px) {
+  .settings nav a { white-space: nowrap; flex: none; }
+  .settings nav { scrollbar-width: none; }
+  th, td { padding: 8px 10px; }
+  .card { padding: 16px; }
+  .card.flush { padding: 0; }
+  .topbar { margin-bottom: 16px; }
+  .topbar h1 { font-size: 20px !important; }
+  .toolbar input.search { max-width: none; flex: 1 1 160px; }
+  .actions { flex-wrap: wrap; }
+}
+@media (max-width: 640px) {
+  .modal-bg { padding: 10px; }
+  .modal { max-height: calc(100vh - 20px); max-height: calc(100dvh - 20px); border-radius: 18px; }
+  .modal.full { height: calc(100vh - 20px); height: calc(100dvh - 20px); }
+  .modal header { padding: 14px 16px 4px; }
+  .modal .body { padding: 10px 16px; }
+  .modal footer { padding: 10px 16px 14px; }
+  .modal footer button { flex: 1 1 auto; justify-content: center; }
+  /* iOS zooms the page when focusing inputs under 16px */
+  input:not([type=checkbox]):not([type=radio]), select, textarea { font-size: 16px; }
+  #toasts { left: 18px; right: 18px; align-items: stretch; }
+  .toast { max-width: none; }
+  .ctr .btns button.sm { padding: 5px 9px; }
+}

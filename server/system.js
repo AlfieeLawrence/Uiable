@@ -114,39 +114,24 @@ router.post('/services/:name/:action', wrap(async (req, res) => {
 // ---------------------------------------------------------------- network
 // Backends live in netbackends.js: NetworkManager first, then iwd / wpa_supplicant /
 // netplan / systemd-networkd / ip. All detection and commands run on the HOST (nsenter).
-const netb = require('./netbackends').create({ run: host.run, root: host.HOST_ROOT });
+const netb = require('./netbackends').create({ run: host.run, root: host.HOST_ROOT, dataDir: require('./auth').DATA_DIR });
 const jobs = require('./jobs');
 
 router.get('/network', wrap(async (req, res) => {
   const d = await netb.detect(req.query.refresh === '1');
-  let interfaces = [];
-  const ip = await host.run('ip', ['-j', 'addr'], { timeout: 8000 });
-  if (ip.code === 0) {
-    try {
-      interfaces = JSON.parse(ip.stdout).map((i) => ({
-        name: i.ifname, state: i.operstate, mac: i.address, mtu: i.mtu,
-        addresses: (i.addr_info || []).map((a) => `${a.local}/${a.prefixlen}`),
-      }));
-    } catch (_) {}
-  }
-  if (!interfaces.length) {
-    const o = await host.run('ip', ['-o', 'addr'], { timeout: 8000 });
-    const map = {};
-    o.stdout.split('\n').forEach((l) => { const p = l.trim().split(/\s+/); if (p.length > 3) { (map[p[1]] = map[p[1]] || { name: p[1], state: '', addresses: [] }).addresses.push(p[3]); } });
-    interfaces = Object.values(map);
-  }
-  const devices = await netb.devices(d, interfaces).catch(() => []);
-  const gw = await host.run('ip', ['route', 'show', 'default'], { timeout: 5000 });
-  const dns = await fsp.readFile(path.join(host.HOST_ROOT, 'etc/resolv.conf'), 'utf8').catch(() => '');
+  const ov = await netb.overview(d);
   const b = d.backends;
   res.json({
     networkManager: d.nm.running,
     message: d.nm.running ? null : d.summary,
-    backend: { wifi: b.wifi, config: b.config, link: b.link, scan: b.scan, summary: d.summary, unsupported: d.unsupported, readOnly: d.readOnly },
+    backend: { wifi: b.wifi, config: b.config, fallbackConfig: b.fallbackConfig, link: b.link, scan: b.scan, summary: d.summary, unsupported: d.unsupported, readOnly: d.readOnly },
     nmInstall: d.install,
-    interfaces, devices,
-    defaultRoute: gw.stdout.trim(),
-    dns: dns.split('\n').filter((l) => l.startsWith('nameserver')).map((l) => l.split(/\s+/)[1]),
+    interfaces: ov.interfaces,
+    devices: ov.interfaces.map((i) => ({ device: i.name, type: i.type, state: i.state, connection: i.connection })), // pre-1.2.5 clients
+    uplink: ov.uplink, routes: ov.routes,
+    defaultRoute: ov.defaultRoute,
+    dns: ov.dns,
+    pending: netb.pendingInfo(),
   });
 }));
 
@@ -174,10 +159,20 @@ router.post('/wifi/connect', wrap(async (req, res) => {
 
 router.post('/network/device/:dev/:action', wrap(async (req, res) => {
   const d = await netb.detect();
-  await netb.deviceAction(d, String(req.params.dev), req.params.action);
-  netb.invalidate();
-  res.json({ ok: true });
+  res.json(await netb.deviceAction(d, String(req.params.dev), req.params.action, { seconds: req.body && req.body.seconds }));
 }));
+
+// Wired / Wi-Fi preference (route metrics). Guarded: auto-reverts unless confirmed.
+router.post('/network/uplink', wrap(async (req, res) => {
+  const d = await netb.detect(true);
+  const out = await netb.setUplink(d, { mode: req.body.mode, seconds: req.body.seconds });
+  audit.write({ user: req.session.username, role: req.session.role, ip: req.socket.remoteAddress, action: 'network.uplink', ok: true, details: { kind: String(req.body.mode || '') } });
+  res.json(out);
+}));
+
+// Confirm or revert a guarded change (IP settings, uplink, disconnect).
+router.post('/network/pending/confirm', wrap(async (req, res) => res.json(netb.confirmPending(String(req.body.token || '')))));
+router.post('/network/pending/revert', wrap(async (req, res) => res.json(await netb.revertPending(String(req.body.token || '')))));
 
 router.get('/network/config/:dev', wrap(async (req, res) => {
   const d = await netb.detect();
@@ -186,8 +181,7 @@ router.get('/network/config/:dev', wrap(async (req, res) => {
 
 router.post('/network/config', wrap(async (req, res) => {
   const d = await netb.detect();
-  const out = await netb.setIpConfig(d, req.body || {});
-  netb.invalidate();
+  const out = await netb.setIpConfig(d, req.body || {}, { seconds: req.body && req.body.seconds });
   audit.write({ user: req.session.username, role: req.session.role, ip: req.socket.remoteAddress, action: 'network.ipconfig', ok: true, details: { iface: String(req.body.device || ''), kind: String(req.body.mode || ''), target: out.backend } });
   res.json(Object.assign({ ok: true }, out));
 }));

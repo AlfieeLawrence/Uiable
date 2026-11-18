@@ -60,7 +60,7 @@ function stackDetail(el, name) {
       const r = await GET('/stacks/' + encodeURIComponent(name));
       body.innerHTML = `<div class="grid cols-2"><div class="card"><div class="card-title">Status</div>${(r.status.containers || []).map((c) => `<div class="list-item"><span class="chip ${/running/i.test(c.State || c.Status || '') ? 'ok' : ''}">${esc(c.State || c.Status || '')}</span><div class="grow mono">${esc(c.Name || c.Service || '')}</div></div>`).join('') || '<div class="muted">No containers</div>'}${r.status.error ? `<div class="notice">${esc(r.status.error)}</div>` : ''}</div>
         <div class="card"><div class="card-title">Compose file</div><pre class="out" style="max-height:50vh">${esc(r.yaml)}</pre></div></div>
-        <div class="card" style="margin-top:16px"><div class="card-title">Logs <button class="sm" data-logs>Refresh</button></div><pre class="out" data-logout style="max-height:40vh">Click refresh.</pre></div>`;
+        <div class="card" style="margin-top:16px"><div class="card-title">Logs <button class="sm" data-logs>Refresh</button></div><pre class="out log-out" data-logout style="min-height:160px;height:40vh;max-height:80vh;resize:vertical">Click refresh.</pre></div>`;
       $('[data-logs]', body).onclick = async () => { const l = await GET(`/stacks/${encodeURIComponent(name)}/logs?tail=200`); $('[data-logout]', body).textContent = l.logs || '(empty)'; };
     } catch (e) { body.innerHTML = `<div class="notice">${esc(e.message)}</div>`; }
   };

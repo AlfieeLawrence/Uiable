@@ -205,7 +205,7 @@ test('PROBE script parses with sh -n', () => {
 });
 
 // ---- runtime with a fake host
-function fakeHost(responses, root) {
+function fakeHost(responses, root, opts) {
   const calls = [];
   const run = async (cmd, args) => {
     calls.push([cmd, ...args]);
@@ -213,7 +213,7 @@ function fakeHost(responses, root) {
     for (const [re, r] of responses) if (re.test(key)) return Object.assign({ code: 0, stdout: '', stderr: '' }, typeof r === 'function' ? r(args) : r);
     return { code: 127, stdout: '', stderr: 'not found' };
   };
-  return { calls, netb: nb.create({ run, root }) };
+  return { calls, netb: nb.create({ run, root, dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'data-')), opts: Object.assign({ fast: true, wifiWaitMs: 0 }, opts) }) };
 }
 
 test('detect: nmcli missing on host -> fallback + install offer', async () => {
@@ -243,71 +243,422 @@ test('detect: NM installed but stopped -> no install button', async () => {
   assert.match(d.summary, /not running/);
 });
 
+
+// ip -j addr fixtures
+const ipAddr = (name, { up = true, carrier = true, v4 = null, kind = '', dynamic = true } = {}) => ({
+  ifname: name, operstate: up && carrier ? 'UP' : 'DOWN', address: '00:11:22:33:44:55', mtu: 1500,
+  flags: [...(up ? ['UP'] : []), ...(up && carrier ? ['LOWER_UP'] : []), ...(up && !carrier ? ['NO-CARRIER'] : []), 'BROADCAST', 'MULTICAST'],
+  ...(kind ? { linkinfo: { info_kind: kind } } : {}),
+  addr_info: v4 ? [{ family: 'inet', local: v4.split('/')[0], prefixlen: +v4.split('/')[1], scope: 'global', dynamic }] : [],
+});
+const json = (x) => ({ stdout: JSON.stringify(x) });
+
+test('parseIpAddrJson + ifaceType + ifaceStatus (docker bridge is idle, not "disconnected")', () => {
+  const ifs = nb.parseIpAddrJson(JSON.stringify([
+    { ifname: 'lo', flags: ['LOOPBACK', 'UP', 'LOWER_UP'], operstate: 'UNKNOWN', addr_info: [{ family: 'inet', local: '127.0.0.1', prefixlen: 8, scope: 'host' }] },
+    ipAddr('enp0s25', { v4: '192.168.1.200/24' }),
+    ipAddr('wlp3s0', { carrier: false }),
+    ipAddr('docker0', { carrier: false, v4: '172.17.0.1/16', kind: 'bridge', dynamic: false }),
+    ipAddr('enp1s0', { carrier: false }),
+  ]));
+  const wl = ['wlp3s0'];
+  const t = Object.fromEntries(ifs.map((i) => [i.name, nb.ifaceType(i, wl)]));
+  assert.deepEqual(t, { lo: 'loopback', enp0s25: 'ethernet', wlp3s0: 'wifi', docker0: 'virtual', enp1s0: 'ethernet' });
+  const st = (n, w) => nb.ifaceStatus(ifs.find((i) => i.name === n), t[n], w);
+  assert.deepEqual(st('docker0'), { state: 'idle', label: 'idle (nothing attached)', canLink: false });
+  assert.equal(st('lo').canLink, false);
+  assert.equal(st('enp0s25').state, 'connected');
+  assert.equal(st('enp1s0').state, 'no-cable');
+  assert.equal(st('wlp3s0', { connected: false }).state, 'disconnected');
+  assert.equal(st('wlp3s0', { connected: true, ssid: 'Home' }).state, 'no-ip');
+  assert.equal(ifs.find((i) => i.name === 'enp0s25').dynamic, true);
+  assert.deepEqual(ifs.find((i) => i.name === 'lo').ipv4, []);
+});
+
+test('parseDefaultRoutes sorts by metric, linkdown last', () => {
+  const r = nb.parseDefaultRoutes(JSON.stringify([
+    { dst: 'default', gateway: '192.168.1.1', dev: 'wlp3s0', protocol: 'dhcp', metric: 600 },
+    { dst: 'default', gateway: '192.168.1.1', dev: 'enp1s0', metric: 50, flags: ['linkdown'] },
+    { dst: 'default', gateway: '192.168.1.1', dev: 'enp0s25', protocol: 'dhcp', metric: 100 },
+  ]));
+  assert.deepEqual(r.map((x) => x.dev), ['enp0s25', 'wlp3s0', 'enp1s0']);
+});
+
+test('parseResolvectlDns + parseIwLink + parseRfkill', () => {
+  const d = nb.parseResolvectlDns('Global: 1.1.1.1\nLink 2 (enp0s25): 192.168.1.1 fe80::1%enp0s25\nLink 3 (wlp3s0):\nLink 4 (docker0):\n');
+  assert.deepEqual(d, { global: ['1.1.1.1'], links: { enp0s25: ['192.168.1.1', 'fe80::1'], wlp3s0: [], docker0: [] } });
+  assert.deepEqual(nb.parseIwLink('Not connected.\n'), { connected: false });
+  const l = nb.parseIwLink('Connected to aa:bb:cc:dd:ee:ff (on wlp3s0)\n\tSSID: Home Net\n\tfreq: 5180\n\tsignal: -55 dBm\n');
+  assert.deepEqual(l, { connected: true, bssid: 'aa:bb:cc:dd:ee:ff', ssid: 'Home Net', signal: 90, dbm: -55, channel: '36' });
+  assert.deepEqual(nb.parseRfkill('phy0 wlan 1 0\nhci0 bluetooth 0 0\n'), [{ name: 'phy0', type: 'wlan', soft: true, hard: false }, { name: 'hci0', type: 'bluetooth', soft: false, hard: false }]);
+});
+
+test('classifyWifiFailure picks the real reason', () => {
+  const c = (x) => nb.classifyWifiFailure(x).code;
+  assert.equal(c({ rfkill: [{ type: 'wlan', soft: false, hard: true }] }), 'rfkill-hard');
+  assert.equal(c({ rfkill: [{ type: 'wlan', soft: true, hard: false }] }), 'rfkill-soft');
+  assert.equal(c({ supplicantMissing: true }), 'no-supplicant');
+  assert.equal(c({ log: 'wlp3s0: WPA: 4-Way Handshake failed - pre-shared key may be incorrect' }), 'wrong-password');
+  assert.equal(c({ log: 'CTRL-EVENT-SSID-TEMP-DISABLED id=0 ssid="Home" auth_failures=1 duration=10 reason=WRONG_KEY' }), 'wrong-password');
+  assert.equal(c({ nmError: 'Error: Connection activation failed: Secrets were required, but not provided.' }), 'wrong-password');
+  assert.equal(c({ log: 'CTRL-EVENT-NETWORK-NOT-FOUND', regdom: '00' }), 'not-found');
+  assert.match(nb.classifyWifiFailure({ log: 'CTRL-EVENT-NETWORK-NOT-FOUND', regdom: '00' }).message, /iw reg set/);
+  assert.equal(c({ log: 'CTRL-EVENT-ASSOC-REJECT bssid=aa status_code=17' }), 'assoc-reject');
+  assert.equal(c({ associated: true, ip: false }), 'no-dhcp');
+  assert.equal(c({}), 'timeout');
+});
+
+test('planUplink + inferUplinkMode', () => {
+  assert.deepEqual(nb.planUplink('prefer-wired'), { ethernet: { metric: 100, defaultRoute: true }, wifi: { metric: 600, defaultRoute: true } });
+  assert.deepEqual(nb.planUplink('prefer-wifi'), { ethernet: { metric: 600, defaultRoute: true }, wifi: { metric: 100, defaultRoute: true } });
+  assert.equal(nb.planUplink('wired-only').wifi.defaultRoute, false);
+  assert.equal(nb.planUplink('wifi-only').ethernet.defaultRoute, false);
+  assert.throws(() => nb.planUplink('bogus'), /Mode must be/);
+  const types = { enp0s25: 'ethernet', wlp3s0: 'wifi' };
+  assert.equal(nb.inferUplinkMode([{ dev: 'enp0s25', metric: 100, family: 4 }, { dev: 'wlp3s0', metric: 600, family: 4 }], types), 'prefer-wired');
+  assert.equal(nb.inferUplinkMode([{ dev: 'wlp3s0', metric: 100, family: 4 }, { dev: 'enp0s25', metric: 600, family: 4 }], types), 'prefer-wifi');
+  assert.equal(nb.inferUplinkMode([{ dev: 'wlp3s0', metric: 600, family: 4 }], types), 'wifi-only');
+});
+
+test('applyUplinkToNetplan: DHCP gets dhcp4-overrides; own static keeps/parks gateway; foreign static warns', () => {
+  let r = nb.applyUplinkToNetplan({}, { device: 'enp0s25', plan: { metric: 100, defaultRoute: true }, merged: { dhcp4: true } });
+  assert.deepEqual(r.doc.network.ethernets.enp0s25, { 'dhcp4-overrides': { 'route-metric': 100, 'use-routes': true }, dhcp4: true });
+  r = nb.applyUplinkToNetplan(r.doc, { device: 'wlp3s0', wireless: true, plan: { metric: 600, defaultRoute: false }, merged: { dhcp4: true, 'access-points': { Home: {} } } });
+  assert.deepEqual(r.doc.network.wifis.wlp3s0['dhcp4-overrides'], { 'route-metric': 600, 'use-routes': false });
+  const own = { network: { version: 2, ethernets: { enp0s25: { dhcp4: false, addresses: ['192.168.1.200/24'], routes: [{ to: 'default', via: '192.168.1.1' }] } } } };
+  r = nb.applyUplinkToNetplan(own, { device: 'enp0s25', plan: { metric: 600, defaultRoute: true }, merged: own.network.ethernets.enp0s25 });
+  assert.deepEqual(r.doc.network.ethernets.enp0s25.routes, [{ to: 'default', via: '192.168.1.1', metric: 600 }]);
+  r = nb.applyUplinkToNetplan(r.doc, { device: 'enp0s25', plan: { metric: 600, defaultRoute: false }, merged: r.doc.network.ethernets.enp0s25 });
+  assert.equal(r.removedGateway, '192.168.1.1'); assert.equal(r.doc.network.ethernets.enp0s25.routes, undefined);
+  r = nb.applyUplinkToNetplan(r.doc, { device: 'enp0s25', plan: { metric: 100, defaultRoute: true }, merged: r.doc.network.ethernets.enp0s25, savedGateway: '192.168.1.1' });
+  assert.deepEqual(r.doc.network.ethernets.enp0s25.routes, [{ to: 'default', via: '192.168.1.1', metric: 100 }]);
+  r = nb.applyUplinkToNetplan({}, { device: 'enp0s25', plan: { metric: 600, defaultRoute: true }, merged: { addresses: ['10.0.0.2/24'], routes: [{ to: 'default', via: '10.0.0.1' }] } });
+  assert.match(r.warning, /fixed gateway/);
+});
+
+test('networkd drop-in + nmcli uplink args', () => {
+  assert.match(nb.buildNetworkdUplinkDropin({ metric: 600, defaultRoute: false }), /\[DHCPv4\]\nRouteMetric=600\nUseGateway=no/);
+  assert.deepEqual(nb.nmUplinkArgs('Wired 1', { metric: 100, defaultRoute: true }).slice(0, 5), ['connection', 'modify', 'Wired 1', 'ipv4.route-metric', '100']);
+  assert.ok(nb.nmUplinkArgs('Home', { metric: 600, defaultRoute: false }).includes('yes'));
+});
+
+// ---- runtime: Alfie's host (Ubuntu Server: netplan + networkd, no NM, iw present)
+const ALFIE_PROBE = 'bin:netplan\nbin:networkctl\nbin:ip\nbin:iw\nbin:journalctl\nbin:resolvectl\nunit:systemd-networkd:active\ndir:netplan\nwifi:wlp3s0\n';
+const alfieAddrs = (wifiIp) => json([ipAddr('enp0s25', { v4: '192.168.1.200/24' }), ipAddr('wlp3s0', { v4: wifiIp }), ipAddr('docker0', { carrier: false, v4: '172.17.0.1/16', kind: 'bridge', dynamic: false })]);
+
+test('netplan Wi-Fi without wpa_supplicant fails fast with the real reason (Alfie 1.2.4 case)', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'root-'));
+  const { netb, calls } = fakeHost([
+    [/^nmcli /, { code: 127 }],
+    [/^sh -c for b in/, { stdout: ALFIE_PROBE }],
+    [/^sh -c for r in/, { stdout: 'phy0 wlan 0 0\n' }],
+  ], root);
+  const d = await netb.detect(true);
+  assert.equal(d.backends.wifi, 'netplan');
+  await assert.rejects(netb.wifiConnect(d, { ssid: 'Home', password: 'longenough1', device: 'wlp3s0' }), /wpasupplicant/);
+  assert.ok(!calls.some((c) => c[0] === 'netplan' && c[1] === 'apply'), 'nothing applied');
+});
+
+test('netplan Wi-Fi: wrong password is detected, config rolled back', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'root-'));
+  const { netb, calls } = fakeHost([
+    [/^nmcli /, { code: 127 }],
+    [/^sh -c for b in/, { stdout: ALFIE_PROBE + 'bin:wpa_supplicant\n' }],
+    [/^sh -c for r in/, { stdout: 'phy0 wlan 0 0\n' }],
+    [/^netplan /, {}],
+    [/^iw dev wlp3s0 link/, { stdout: 'Not connected.\n' }],
+    [/^iw reg get/, { stdout: 'global\ncountry GB: DFS-ETSI\n' }],
+    [/^ip -j -4 addr show dev wlp3s0/, json([ipAddr('wlp3s0')])],
+    [/^ip /, {}],
+    [/^journalctl /, { stdout: 'wlp3s0: WPA: 4-Way Handshake failed - pre-shared key may be incorrect\nCTRL-EVENT-SSID-TEMP-DISABLED reason=WRONG_KEY\n' }],
+  ], root);
+  const d = await netb.detect(true);
+  await assert.rejects(netb.wifiConnect(d, { ssid: 'Home', password: 'wrongpass1', device: 'wlp3s0' }), (e) => /Wrong Wi-Fi password/.test(e.message) && /rolled back/.test(e.message) && !e.message.includes('wrongpass1'));
+  assert.equal(fs.existsSync(path.join(root, 'etc/netplan/90-uiable.yaml')), false, 'own netplan file removed again');
+  assert.equal(calls.filter((c) => c[0] === 'netplan' && c[1] === 'apply').length, 2, 'applied, then re-applied after rollback');
+});
+
+test('netplan Wi-Fi: success only once associated with an IP', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'root-'));
+  const { netb } = fakeHost([
+    [/^nmcli /, { code: 127 }],
+    [/^sh -c for b in/, { stdout: ALFIE_PROBE + 'bin:wpa_supplicant\n' }],
+    [/^sh -c for r in/, { stdout: 'phy0 wlan 0 0\n' }],
+    [/^netplan /, {}],
+    [/^iw dev wlp3s0 link/, { stdout: 'Connected to aa:bb:cc:dd:ee:ff (on wlp3s0)\n\tSSID: Home\n\tsignal: -60 dBm\n' }],
+    [/^ip -j -4 addr show dev wlp3s0/, json([ipAddr('wlp3s0', { v4: '192.168.1.201/24' })])],
+    [/^ip /, {}],
+  ], root);
+  const d = await netb.detect(true);
+  const out = await netb.wifiConnect(d, { ssid: 'Home', password: 'rightpass1', device: 'wlp3s0' });
+  assert.equal(out.ip, '192.168.1.201/24'); assert.equal(out.signal, 80);
+  const y = yaml.load(fs.readFileSync(path.join(root, 'etc/netplan/90-uiable.yaml'), 'utf8'));
+  assert.deepEqual(Object.keys(y.network.wifis.wlp3s0['access-points']), ['Home']);
+});
+
+test('soft rfkill is unblocked automatically; hard block is reported', async () => {
+  let blocked = true;
+  const { netb } = fakeHost([
+    [/^nmcli /, { code: 127 }],
+    [/^sh -c for b in/, { stdout: ALFIE_PROBE + 'bin:wpa_supplicant\n' }],
+    [/^sh -c for r in/, () => ({ stdout: `phy0 wlan ${blocked ? 1 : 0} 0\n` })],
+    [/^sh -c rfkill unblock/, () => { blocked = false; return {}; }],
+    [/^netplan /, {}],
+    [/^iw dev wlp3s0 link/, { stdout: 'Connected to aa:bb:cc:dd:ee:ff (on wlp3s0)\n\tSSID: Home\n' }],
+    [/^ip -j -4 addr show dev wlp3s0/, json([ipAddr('wlp3s0', { v4: '192.168.1.201/24' })])],
+    [/^ip /, {}],
+  ], fs.mkdtempSync(path.join(os.tmpdir(), 'root-')));
+  const d = await netb.detect(true);
+  await netb.wifiConnect(d, { ssid: 'Home', password: 'rightpass1', device: 'wlp3s0' });
+  assert.equal(blocked, false);
+  const h = fakeHost([
+    [/^nmcli /, { code: 127 }],
+    [/^sh -c for b in/, { stdout: ALFIE_PROBE + 'bin:wpa_supplicant\n' }],
+    [/^sh -c for r in/, { stdout: 'phy0 wlan 0 1\n' }],
+    [/^sh -c rfkill/, {}],
+  ], os.tmpdir());
+  await assert.rejects(h.netb.wifiConnect(await h.netb.detect(true), { ssid: 'Home', password: 'rightpass1', device: 'wlp3s0' }), /hardware/);
+});
+
 test('wifiConnect via wpa_supplicant never puts the plaintext password in argv', async () => {
   const pw = 'Sup3rSecretPass';
   const { netb, calls } = fakeHost([
     [/^nmcli /, { code: 127 }],
-    [/^sh -c /, { stdout: 'bin:wpa_cli\nbin:ip\nproc:wpa_supplicant\nwifi:wlan0\n' }],
+    [/^sh -c for b in/, { stdout: 'bin:wpa_cli\nbin:ip\nproc:wpa_supplicant\nwifi:wlan0\n' }],
+    [/^sh -c for r in/, { stdout: '' }],
     [/add_network/, { stdout: '3\n' }],
     [/save_config/, { stdout: 'OK\n' }],
+    [/wpa_cli -i wlan0 status/, { stdout: 'wpa_state=COMPLETED\nssid=Home\n' }],
+    [/signal_poll/, { stdout: 'RSSI=-50\n' }],
     [/^wpa_cli /, { stdout: 'OK\n' }],
+    [/^ip -j -4 addr show dev wlan0/, json([ipAddr('wlan0', { v4: '10.0.0.9/24' })])],
+    [/^ip /, {}],
   ], os.tmpdir());
   const d = await netb.detect(true);
   const out = await netb.wifiConnect(d, { ssid: 'Home', password: pw, device: 'wlan0' });
-  assert.equal(out.persisted, true);
+  assert.equal(out.persisted, true); assert.equal(out.ip, '10.0.0.9/24');
   assert.ok(!JSON.stringify(calls).includes(pw));
   assert.ok(calls.some((c) => c.includes('psk') && c.includes(nb.wpaPsk('Home', pw))));
   assert.ok(calls.some((c) => c.includes('ssid') && c.includes(Buffer.from('Home').toString('hex'))));
 });
 
-test('wifiConnect error text is scrubbed (iwd)', async () => {
+test('wifiConnect error text is scrubbed (iwd) and network forgotten', async () => {
   const pw = 'Sup3rSecretPass';
-  const { netb } = fakeHost([
+  const { netb, calls } = fakeHost([
     [/^nmcli /, { code: 127 }],
-    [/^sh -c /, { stdout: 'bin:iwctl\nbin:ip\nunit:iwd:active\nwifi:wlan0\n' }],
-    [/^iwctl --passphrase/, { code: 1, stderr: `Operation failed for passphrase ${pw}` }],
+    [/^sh -c for b in/, { stdout: 'bin:iwctl\nbin:ip\nunit:iwd:active\nwifi:wlan0\n' }],
+    [/^sh -c for r in/, { stdout: '' }],
+    [/^iwctl --passphrase/, { code: 1, stderr: `Operation failed: invalid passphrase ${pw}` }],
+    [/^iwctl /, {}],
+    [/^ip /, {}],
   ], os.tmpdir());
   const d = await netb.detect(true);
-  await assert.rejects(netb.wifiConnect(d, { ssid: 'Home', password: pw, device: 'wlan0' }), (e) => !e.message.includes(pw) && /••••/.test(e.message));
+  await assert.rejects(netb.wifiConnect(d, { ssid: 'Home', password: pw, device: 'wlan0' }), (e) => !e.message.includes(pw) && /Wrong Wi-Fi password/.test(e.message));
+  assert.ok(calls.some((c) => c.join(' ') === 'iwctl known-networks Home forget'));
 });
 
-test('setIpConfig via systemd-networkd writes unit and reloads', async () => {
+test('NetworkManager path: nmcli error classified, IP verified', async () => {
+  const { netb } = fakeHost([
+    [/^nmcli -t -f RUNNING/, { stdout: 'running\n' }],
+    [/^sh -c for b in/, { stdout: 'bin:nmcli\nbin:ip\nwifi:wlp3s0\n' }],
+    [/^sh -c for r in/, { stdout: '' }],
+    [/^nmcli --wait 45 device wifi connect/, { code: 4, stderr: 'Error: Connection activation failed: Secrets were required, but not provided.' }],
+    [/^nmcli -t -f DEVICE,TYPE,STATE,CONNECTION device/, { stdout: 'wlp3s0:wifi:disconnected:--\nenp0s25:ethernet:unmanaged:--\n' }],
+    [/^nmcli /, {}],
+    [/^ip -j -4 addr show dev wlp3s0/, json([ipAddr('wlp3s0')])],
+  ], os.tmpdir());
+  const d = await netb.detect(true);
+  await assert.rejects(netb.wifiConnect(d, { ssid: 'Home', password: 'badpass12', device: 'wlp3s0' }), /Wrong Wi-Fi password/);
+});
+
+test('overview: Alfie host shows primary uplink, docker0 idle without link buttons', async () => {
+  const { netb } = fakeHost([
+    [/^nmcli /, { code: 127 }],
+    [/^sh -c for b in/, { stdout: ALFIE_PROBE }],
+    [/^ip -j -d addr/, alfieAddrs(null)],
+    [/^ip -j route show default/, json([{ dst: 'default', gateway: '192.168.1.1', dev: 'enp0s25', protocol: 'dhcp', metric: 100 }])],
+    [/^ip -j -6 route/, json([])],
+    [/^resolvectl dns/, { stdout: 'Global:\nLink 2 (enp0s25): 192.168.1.1\n' }],
+    [/^iw dev wlp3s0 link/, { stdout: 'Not connected.\n' }],
+  ], os.tmpdir());
+  const ov = await netb.overview(await netb.detect(true));
+  const by = Object.fromEntries(ov.interfaces.map((i) => [i.name, i]));
+  assert.deepEqual(ov.uplink.primary, { dev: 'enp0s25', type: 'ethernet', gateway: '192.168.1.1', metric: 100, ip: '192.168.1.200/24' });
+  assert.equal(by.enp0s25.primary, true); assert.deepEqual(by.enp0s25.dns, ['192.168.1.1']); assert.equal(by.enp0s25.gateway, '192.168.1.1');
+  assert.equal(by.docker0.canLink, false); assert.equal(by.docker0.state, 'idle'); assert.equal(by.docker0.canConfig, false);
+  assert.equal(by.wlp3s0.state, 'disconnected'); assert.equal(by.wlp3s0.canLink, true);
+  assert.equal(ov.uplink.mode, 'prefer-wired'); assert.equal(ov.uplink.canSet, true);
+  assert.deepEqual([ov.uplink.wired, ov.uplink.wireless], [['enp0s25'], ['wlp3s0']]);
+});
+
+test('deviceAction refuses docker bridges; disconnect is guarded and auto-reverts', async () => {
+  const { netb, calls } = fakeHost([
+    [/^nmcli /, { code: 127 }],
+    [/^sh -c for b in/, { stdout: ALFIE_PROBE }],
+    [/^ip -j -d addr show dev docker0/, json([ipAddr('docker0', { kind: 'bridge', carrier: false })])],
+    [/^ip -j -d addr show dev enp0s25/, json([ipAddr('enp0s25', { v4: '192.168.1.200/24' })])],
+    [/^(ip|networkctl) /, {}],
+  ], os.tmpdir(), { rollbackMs: 30 });
+  const d = await netb.detect(true);
+  await assert.rejects(netb.deviceAction(d, 'docker0', 'connect'), /virtual/);
+  const r = await netb.deviceAction(d, 'enp0s25', 'disconnect');
+  assert.ok(r.pending && r.pending.token);
+  assert.equal(netb.pendingInfo().label, 'Disconnect enp0s25');
+  await assert.rejects(netb.deviceAction(d, 'enp0s25', 'disconnect'), /waiting for confirmation/);
+  await new Promise((res) => setTimeout(res, 80));
+  assert.equal(netb.pendingInfo(), null);
+  assert.ok(calls.some((c) => c.join(' ') === 'ip link set dev enp0s25 up'), 'brought back up after timeout');
+});
+
+test('setUplink via netplan writes metrics, confirm keeps it; revert restores', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'root-'));
+  const resp = [
+    [/^nmcli /, { code: 127 }],
+    [/^sh -c for b in/, { stdout: ALFIE_PROBE + 'bin:wpa_supplicant\n' }],
+    [/^ip -j -d addr/, alfieAddrs('192.168.1.201/24')],
+    [/^ip -j route show default/, json([{ dst: 'default', gateway: '192.168.1.1', dev: 'enp0s25', metric: 100 }, { dst: 'default', gateway: '192.168.1.1', dev: 'wlp3s0', metric: 600 }])],
+    [/^ip -j -6 route/, json([])],
+    [/^iw dev wlp3s0 link/, { stdout: 'Connected to aa:bb:cc:dd:ee:ff (on wlp3s0)\n\tSSID: Home\n' }],
+    [/^netplan get network.ethernets.enp0s25/, { stdout: 'dhcp4: true\n' }],
+    [/^netplan get network.wifis.wlp3s0/, { stdout: 'dhcp4: true\naccess-points:\n  Home: {}\n' }],
+    [/^netplan /, {}],
+  ];
+  const { netb } = fakeHost(resp, root, { rollbackMs: 10000 });
+  const d = await netb.detect(true);
+  const out = await netb.setUplink(d, { mode: 'prefer-wifi' });
+  assert.match(out.note, /fails over/); assert.match(out.note, /192\.168\.1\.201/);
+  const y = yaml.load(fs.readFileSync(path.join(root, 'etc/netplan/90-uiable.yaml'), 'utf8'));
+  assert.equal(y.network.wifis.wlp3s0['dhcp4-overrides']['route-metric'], 100);
+  assert.equal(y.network.ethernets.enp0s25['dhcp4-overrides']['route-metric'], 600);
+  const ov = await netb.overview(d);
+  assert.equal(ov.uplink.mode, 'prefer-wifi'); assert.equal(ov.uplink.modeStored, true);
+  await netb.revertPending(out.pending.token);
+  assert.equal(fs.existsSync(path.join(root, 'etc/netplan/90-uiable.yaml')), false);
+  const out2 = await netb.setUplink(d, { mode: 'prefer-wired' });
+  assert.deepEqual(netb.confirmPending(out2.pending.token), { ok: true, kept: 'Wired / Wi-Fi: prefer-wired' });
+  assert.ok(fs.existsSync(path.join(root, 'etc/netplan/90-uiable.yaml')));
+});
+
+test('setIpConfig via systemd-networkd writes unit, is guarded, rollback restores', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'root-'));
   const { netb, calls } = fakeHost([
     [/^nmcli /, { code: 127 }],
-    [/^sh -c /, { stdout: 'bin:networkctl\nbin:ip\nunit:systemd-networkd:active\n' }],
+    [/^sh -c for b in/, { stdout: 'bin:networkctl\nbin:ip\nunit:systemd-networkd:active\n' }],
     [/^networkctl /, {}],
-  ], root);
+  ], root, { rollbackMs: 30 });
   const d = await netb.detect(true);
   const r = await netb.setIpConfig(d, { device: 'eth0', mode: 'static', address: '10.0.0.2/24', gateway: '10.0.0.1', dns: '1.1.1.1' });
-  assert.equal(r.backend, 'systemd-networkd');
-  const t = fs.readFileSync(path.join(root, 'etc/systemd/network/10-uiable-eth0.network'), 'utf8');
-  assert.match(t, /Address=10\.0\.0\.2\/24/);
+  assert.equal(r.backend, 'systemd-networkd'); assert.ok(r.pending);
+  const f = path.join(root, 'etc/systemd/network/10-uiable-eth0.network');
+  assert.match(fs.readFileSync(f, 'utf8'), /Address=10\.0\.0\.2\/24/);
   assert.ok(calls.some((c) => c.join(' ') === 'networkctl reload'));
-  assert.deepEqual(await netb.getIpConfig(d, 'eth0'), { managed: true, mode: 'static', address: '10.0.0.2/24', gateway: '10.0.0.1', dns: '1.1.1.1' });
+  assert.deepEqual(await netb.getIpConfig(d, 'eth0'), { backend: 'systemd-networkd', managed: true, mode: 'static', address: '10.0.0.2/24', gateway: '10.0.0.1', dns: '1.1.1.1' });
+  await new Promise((res) => setTimeout(res, 80));
+  assert.equal(fs.existsSync(f), false, 'unconfirmed change rolled back');
 });
 
 test('setIpConfig via netplan rolls back when netplan generate fails', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'root-'));
   const { netb } = fakeHost([
     [/^nmcli /, { code: 127 }],
-    [/^sh -c /, { stdout: 'bin:netplan\nbin:ip\ndir:netplan\n' }],
+    [/^sh -c for b in/, { stdout: 'bin:netplan\nbin:ip\ndir:netplan\n' }],
     [/^netplan generate/, { code: 1, stderr: 'bad yaml' }],
   ], root);
   const d = await netb.detect(true);
   await assert.rejects(netb.setIpConfig(d, { device: 'eth0', mode: 'dhcp' }), /netplan rejected/);
   assert.equal(fs.existsSync(path.join(root, 'etc/netplan/90-uiable.yaml')), false);
+  assert.equal(netb.pendingInfo(), null);
 });
 
-test('deviceAction without NM uses ip link / iwctl', async () => {
-  const { netb, calls } = fakeHost([
-    [/^nmcli /, { code: 127 }],
-    [/^sh -c /, { stdout: 'bin:iwctl\nbin:ip\nunit:iwd:active\nwifi:wlan0\n' }],
-    [/^(ip|iwctl) /, {}],
-  ], os.tmpdir());
+test('NM wifi-only install: unmanaged wired falls back to netplan for IP settings', async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'root-'));
+  const { netb } = fakeHost([
+    [/^nmcli -t -f RUNNING/, { stdout: 'running\n' }],
+    [/^sh -c for b in/, { stdout: 'bin:nmcli\nbin:netplan\nbin:ip\ndir:netplan\nwifi:wlp3s0\n' }],
+    [/^nmcli -t -f DEVICE,TYPE,STATE,CONNECTION device/, { stdout: 'wlp3s0:wifi:connected:Home\nenp0s25:ethernet:unmanaged:--\n' }],
+    [/^netplan /, {}],
+  ], root);
   const d = await netb.detect(true);
-  await netb.deviceAction(d, 'eth0', 'disconnect');
-  await netb.deviceAction(d, 'wlan0', 'disconnect');
-  assert.deepEqual(calls.slice(-2), [['ip', 'link', 'set', 'dev', 'eth0', 'down'], ['iwctl', 'station', 'wlan0', 'disconnect']]);
-  await assert.rejects(netb.deviceAction(d, 'eth0;reboot', 'connect'), /Bad device/);
+  assert.equal(d.backends.fallbackConfig, 'netplan');
+  const r = await netb.setIpConfig(d, { device: 'enp0s25', mode: 'dhcp' });
+  assert.equal(r.backend, 'netplan');
+  netb.confirmPending(r.pending.token);
+});
+
+// ---- Wi-Fi row "Connect": saved profile or ask for an SSID (never a bare `nmcli device connect`)
+const NM_PROBE = 'bin:nmcli\nbin:ip\nbin:iw\nunit:NetworkManager:active\nproc:NetworkManager\nwifi:wlp3s0\n';
+const nmBase = (extra) => [
+  [/^nmcli -t -f RUNNING general/, { stdout: 'running\n' }],
+  [/^sh -c for b in/, { stdout: NM_PROBE }],
+  [/^nmcli -t -f DEVICE,TYPE,STATE,CONNECTION device/, { stdout: 'wlp3s0:wifi:disconnected:--\nenp0s25:ethernet:connected:Wired connection 1\n' }],
+  [/^ip -j -d addr show dev wlp3s0/, json([ipAddr('wlp3s0', { carrier: false })])],
+  ...extra,
+];
+
+test('parseIwctlKnown + parseWpaNetworks', () => {
+  const iw = '\x1b[1;90m                     Known Networks\x1b[0m\n--------------------------------------------------------------------------------\n  Name                              Security          Hidden  Last connected\n--------------------------------------------------------------------------------\n  BT-Hub-5G                         psk                       Nov 18, 5:01 PM\n  Cafe Wifi                         open\n';
+  assert.deepEqual(nb.parseIwctlKnown(iw), ['BT-Hub-5G', 'Cafe Wifi']);
+  assert.deepEqual(nb.parseIwctlKnown('  No known networks\n'), []);
+  assert.deepEqual(nb.parseWpaNetworks('network id / ssid / bssid / flags\n0\tHome\tany\t[DISABLED]\n'), [{ id: '0', ssid: 'Home', flags: '[DISABLED]' }]);
+  assert.deepEqual(nb.parseWpaNetworks('network id / ssid / bssid / flags\n'), []);
+});
+
+test('deviceAction connect wifi (NM, no saved profile) -> needs-ssid, no `nmcli device connect`', async () => {
+  const { netb, calls } = fakeHost(nmBase([[/^nmcli -t -f NAME,UUID,TYPE,TIMESTAMP connection show/, { stdout: 'Wired connection 1:aaaa:802-3-ethernet:1763480000\n' }]]), os.tmpdir());
+  const d = await netb.detect(true);
+  await assert.rejects(netb.deviceAction(d, 'wlp3s0', 'connect'), (e) => e.status === 409 && e.reason === 'needs-ssid' && /Pick a network/.test(e.message));
+  assert.ok(!calls.some((c) => c.join(' ').startsWith('nmcli device connect')));
+});
+
+test('deviceAction connect wifi (NM, saved profile) -> nmcli connection up uuid, newest matching device', async () => {
+  const { netb, calls } = fakeHost(nmBase([
+    [/^nmcli -t -f NAME,UUID,TYPE,TIMESTAMP connection show/, { stdout: 'Old:u-old:802-11-wireless:100\nOther dev:u-other:802-11-wireless:300\nHome:u-home:802-11-wireless:200\n' }],
+    [/^nmcli -g connection.interface-name connection show uuid u-other/, { stdout: 'wlx0011\n' }],
+    [/^nmcli -g connection.interface-name connection show uuid/, { stdout: '\n' }],
+    [/^nmcli --wait 45 connection up/, {}],
+  ]), os.tmpdir());
+  const d = await netb.detect(true);
+  const r = await netb.deviceAction(d, 'wlp3s0', 'connect');
+  assert.equal(r.ok, true);
+  assert.ok(calls.some((c) => c.join(' ') === 'nmcli --wait 45 connection up uuid u-home ifname wlp3s0'));
+  assert.ok(!calls.some((c) => c.join(' ').startsWith('nmcli device connect')));
+});
+
+test('deviceAction connect ethernet (NM) still uses nmcli device connect', async () => {
+  const { netb, calls } = fakeHost(nmBase([
+    [/^ip -j -d addr show dev enp0s25/, json([ipAddr('enp0s25', { v4: '192.168.1.200/24' })])],
+    [/^nmcli device connect/, {}],
+  ]), os.tmpdir());
+  const d = await netb.detect(true);
+  await netb.deviceAction(d, 'enp0s25', 'connect');
+  assert.ok(calls.some((c) => c.join(' ') === 'nmcli device connect enp0s25'));
+});
+
+test('deviceAction connect wifi via wpa_supplicant / iwd / netplan: saved -> reconnect, none -> needs-ssid', async () => {
+  const wpaProbe = 'bin:wpa_cli\nbin:ip\nproc:wpa_supplicant\nwifi:wlp3s0\n';
+  const base = (probe, extra) => [[/^nmcli /, { code: 127 }], [/^sh -c for b in/, { stdout: probe }], [/^ip -j -d addr show dev wlp3s0/, json([ipAddr('wlp3s0', { carrier: false })])], ...extra, [/^(ip|networkctl|wpa_cli|iwctl) /, {}]];
+  let h = fakeHost(base(wpaProbe, [[/^wpa_cli -i wlp3s0 list_networks/, { stdout: 'network id / ssid / bssid / flags\n' }]]), os.tmpdir());
+  let d = await h.netb.detect(true);
+  assert.equal(d.backends.wifi, 'wpa_supplicant');
+  await assert.rejects(h.netb.deviceAction(d, 'wlp3s0', 'connect'), (e) => e.reason === 'needs-ssid');
+  h = fakeHost(base(wpaProbe, [[/^wpa_cli -i wlp3s0 list_networks/, { stdout: 'network id / ssid / bssid / flags\n0\tHome\tany\t[DISABLED]\n' }]]), os.tmpdir());
+  d = await h.netb.detect(true);
+  await h.netb.deviceAction(d, 'wlp3s0', 'connect');
+  assert.ok(h.calls.some((c) => c.join(' ') === 'wpa_cli -i wlp3s0 enable_network all'));
+  assert.ok(h.calls.some((c) => c.join(' ') === 'wpa_cli -i wlp3s0 reconnect'));
+
+  const iwdProbe = 'bin:iwctl\nbin:ip\nunit:iwd:active\nproc:iwd\nwifi:wlp3s0\n';
+  h = fakeHost(base(iwdProbe, [[/^iwctl known-networks list/, { stdout: '  No known networks\n' }]]), os.tmpdir());
+  d = await h.netb.detect(true);
+  assert.equal(d.backends.wifi, 'iwd');
+  await assert.rejects(h.netb.deviceAction(d, 'wlp3s0', 'connect'), (e) => e.reason === 'needs-ssid');
+
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'root-'));
+  fs.mkdirSync(path.join(root, 'etc/netplan'), { recursive: true });
+  fs.writeFileSync(path.join(root, 'etc/netplan/90-uiable.yaml'), 'network:\n  version: 2\n  wifis:\n    wlp3s0:\n      dhcp4: true\n      access-points:\n        Home: {password: secret123}\n');
+  h = fakeHost(base(ALFIE_PROBE, []), root);
+  d = await h.netb.detect(true);
+  assert.deepEqual(await h.netb.savedWifi(d, 'wlp3s0', {}), { kind: 'netplan', name: 'Home' });
+  await h.netb.deviceAction(d, 'wlp3s0', 'connect');
+  assert.ok(h.calls.some((c) => c.join(' ') === 'ip link set dev wlp3s0 up'));
 });

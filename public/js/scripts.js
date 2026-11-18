@@ -72,7 +72,7 @@ Pages.scripts = (el) => {
             <b>Output</b><span class="spacer"></span>
             <span class="chip plain" data-exit>idle</span>
           </div>
-          <pre class="out" data-out style="min-height:120px;max-height:28vh;margin:0;border-radius:0;background:var(--input)">(run to see live output)</pre>
+          <pre class="out" data-out style="min-height:120px;max-height:60vh;height:28vh;resize:vertical;margin:0;border-radius:0;background:var(--input)">(run to see live output)</pre>
         </div>`;
       $('[data-code]', ed).value = s.content || '#!/bin/bash\n\n';
       if (!isAdmin) $('[data-code]', ed).readOnly = true;
