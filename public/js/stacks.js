@@ -67,6 +67,6 @@ function stackDetail(el, name) {
   $('[data-edit]', el).onclick = () => editStack(name, load);
   $('[data-refresh]', el).onclick = load;
   $$('[data-a]', el).forEach((b) => b.onclick = async () => { const r = await act(b, () => POST(`/stacks/${encodeURIComponent(name)}/${b.dataset.a}`)); if (r) { await watchJob(r.job); load(); } });
-  const del = $('[data-del]', el); if (del) del.onclick = async () => { if (!(await confirmDlg('Delete stack ' + name + '?', 'Removes the compose files. Bring the stack down first.', { okLabel: 'Delete', danger: true }))) return; await act(del, () => DEL('/stacks/' + encodeURIComponent(name))); location.hash = '#/stacks'; };
+  const del = $('[data-del]', el); if (del) del.onclick = async () => { if (!(await typedConfirm({ title: 'Delete stack ' + name + '?', text: 'Removes the compose files for this stack. Bring the stack down first.', word: name, okLabel: 'Delete stack' }))) return; await act(del, () => DEL('/stacks/' + encodeURIComponent(name))); location.hash = '#/stacks'; };
   load();
 }

@@ -10,8 +10,8 @@ let lastPrune = 0;
 const RETENTION_DAYS = () => Math.max(1, Number(process.env.UIABLE_AUDIT_DAYS) || 90);
 
 const SECRET_KEYS = /pass(word|wd)?|current|oldpass|newpass|secret|token|code|otp|cookie|smtp|bot.?token|authorization|api[_-]?key|bearer|private|credential|chpasswd|wifi.?pass/i;
-const SECRET_PATH = /\/password\b|\/login|\/setup|\/wifi\/connect|\/2fa\/|\/tokens?\b|\/account\/2fa|\/self\/apply/i;
-const DETAIL_ALLOW = new Set(['secrets', 'username', 'ssid', 'name', 'channel', 'target', 'from', 'to', 'role', 'self', 'note', 'ok', 'id', 'kind', 'job', 'path', 'action', 'spec', 'port', 'jail', 'ip', 'iface', 'app', 'tag', 'enabled']);
+const SECRET_PATH = /\/linux-user\b|\/password\b|\/login|\/setup|\/wifi\/connect|\/2fa\/|\/tokens?\b|\/account\/2fa|\/self\/apply/i;
+const DETAIL_ALLOW = new Set(['secrets', 'username', 'ssid', 'name', 'channel', 'target', 'from', 'to', 'role', 'self', 'note', 'ok', 'id', 'kind', 'job', 'path', 'action', 'spec', 'port', 'jail', 'ip', 'iface', 'app', 'tag', 'enabled', 'account', 'reason', 'verified']);
 
 function init(dataDir) {
   FILE = path.join(dataDir, 'audit.log');
@@ -24,7 +24,7 @@ function sanitize(body, { pathHint } = {}) {
   if (pathHint && SECRET_PATH.test(pathHint)) {
     const out = { secrets: 'omitted' };
     if (body && typeof body === 'object') {
-      for (const k of ['username', 'ssid', 'name', 'channel', 'role']) {
+      for (const k of ['username', 'ssid', 'name', 'channel', 'role', 'linuxUser']) {
         if (body[k] != null) out[k] = String(body[k]).slice(0, 64);
       }
     }

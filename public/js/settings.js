@@ -34,7 +34,10 @@ Settings.general = async (b) => {
     <div class="card section"><div class="card-title">${ICON.disk} Primary storage mount</div>
       <p class="muted small">The dashboard Storage card highlights this mount. On Umbrel / rugix the big data disk is usually under <span class="mono">/run/rugix/mounts/data</span>. Leave on Auto to pick the largest real disk.</p>
       <div class="row wrap"><select data-pm style="max-width:420px"><option value="">Auto (largest disk)</option>${mounts.map((d) => `<option value="${esc(d.mount)}" ${d.mount === pref ? 'selected' : ''}>${esc(d.mount)} — ${fmtBytes(d.size)} (${fmtBytes(d.avail)} free)</option>`).join('')}</select>
-        <button class="primary" data-savepm>Save</button></div></div>`;
+        <button class="primary" data-savepm>Save</button></div></div>
+    ${can('admin') ? `<div class="card section" id="features"><div class="card-title">${ICON.grid} Features</div>
+      <div class="switch-row"><div class="grow"><b id="ft-store-l">App store</b><p class="muted small" id="ft-store-d">One-click installs from the Uiable app catalog. When off, the store is hidden from the dock, home, search and the dashboard, and its API is blocked on the server. Installed apps keep running.</p></div>
+        <label class="switch"><input type="checkbox" role="switch" data-feature="store" aria-labelledby="ft-store-l" aria-describedby="ft-store-d" ${featureOn('store') ? 'checked' : ''}><span aria-hidden="true"></span></label></div></div>` : ''}`;
   GET('/system/timezones').then((r) => { $('#tzlist').innerHTML = r.timezones.map((t) => `<option value="${esc(t)}">`).join(''); }).catch(() => {});
   $('[data-savehn]', b).onclick = async (e) => {
     const v = $('[data-hn]', b).value.trim();
@@ -42,6 +45,7 @@ Settings.general = async (b) => {
     await act(e.target.closest('button'), () => POST('/system/hostname', { hostname: v }), 'Hostname changed');
   };
   $('[data-savetz]', b).onclick = async (e) => { await act(e.target.closest('button'), () => POST('/system/timezone', { timezone: $('[data-tz]', b).value.trim() }), 'Time zone updated'); reloadSection(); };
+  $$('[data-feature]', b).forEach((cb) => (cb.onchange = async () => { cb.disabled = true; const ok = await setFeature(cb.dataset.feature, cb.checked, { stay: true }); if (!ok) cb.checked = !cb.checked; cb.disabled = false; }));
   $('[data-savepm]', b).onclick = async (e) => { await act(e.target.closest('button'), () => POST('/system/primary-mount', { mount: $('[data-pm]', b).value }), 'Primary mount saved'); };
 };
 
@@ -393,10 +397,11 @@ Settings.accounts = async (b) => {
     const alu = e.target.closest('[data-alu]');
     if (alu) {
       const L = await GET('/accounts-linux-settings');
-      const f = await formDlg(`Linux user for ${alu.dataset.alu}`, [{ name: 'linuxUser', label: 'Linked Linux user', type: 'html', html: `<label class="field"><span>Linked Linux user</span><select name="linuxUser">${linuxUserOptionsHtml(L.users, alu.dataset.cur, { allowNone: true })}</select></label>` }], 'Save', {
-        intro: 'Non-admin accounts always run terminals and scripts as this user. Audit-logged.',
-        handler: (v) => POST(`/accounts/${encodeURIComponent(alu.dataset.alu)}/linux-user`, { linuxUser: $('.modal [name=linuxUser]').value }),
-      });
+      const cur = alu.dataset.cur || '';
+      const f = await modal({ title: `Linux user for ${alu.dataset.alu}`,
+        body: `<p class="muted">Non-admin accounts always run terminals and scripts as this user. To link a Linux user, type <b>that Linux user's</b> password (ask its owner), even as an admin. Unlinking doesn't need it. Audit-logged.</p>${linuxLinkFields(L.users, cur, { allowNone: true })}`,
+        onOpen: (m) => { linuxLinkWire(m, cur); },
+        buttons: [{ label: 'Cancel', value: null }, { label: 'Save', cls: 'primary', handler: (m) => linuxLinkSubmit(m, `/accounts/${encodeURIComponent(alu.dataset.alu)}/linux-user`, cur) }] });
       if (f) { toast('Linux user updated'); reloadSection(); }
       return;
     }
@@ -405,7 +410,7 @@ Settings.accounts = async (b) => {
       const nonRoot = L.users.filter((u) => u.uid !== 0);
       const ok = await modal({ title: 'Linux account linking', body: `<label class="field"><span>Default Linux user for new dashboard accounts</span><select name="def">${linuxUserOptionsHtml(L.users, L.defaultUser, { allowNone: true })}</select></label>
         <div class="field"><span>Users non-admins may link themselves to</span>${nonRoot.map((u) => `<label class="row" style="margin:6px 0"><input type="checkbox" name="al" value="${esc(u.name)}" ${L.allowed.includes(u.name) ? 'checked' : ''}> <span class="mono">${esc(u.name)}</span> <span class="muted small">uid ${u.uid}${u.admin ? ' · sudo' : ''}</span></label>`).join('') || '<p class="muted small">No users with uid ≥ 1000.</p>'}</div>
-        <p class="muted small">Admins can link to any user, including root. Root is never offered to non-admins. The default only applies to non-admins if it is also in the allowed list.</p>`,
+        <p class="muted small">Admins can link to any user, including root. Root is never offered to non-admins. The default is pre-selected when a new account first links (for non-admins only if it is also in the allowed list); linking always needs that Linux user's password.</p>`,
         buttons: [{ label: 'Cancel', value: null }, { label: 'Save', cls: 'primary', keepOpenOnError: true, handler: async (m) => { await PUT('/accounts-linux-settings', { defaultUser: $('[name=def]', m).value, allowed: $$('[name=al]:checked', m).map((x) => x.value) }); return true; } }] });
       if (ok) { toast('Saved'); reloadSection(); }
       return;
@@ -447,8 +452,15 @@ Settings.appearance = (b) => {
   b.innerHTML = `<div class="card"><div class="card-title">${ICON.palette} Theme</div>
     <p class="muted small" style="margin:0 0 10px">Applies to the whole dashboard (same palettes as Uiable Connect).</p>
     <div class="seg" style="flex-wrap:wrap">${opts.map((t) => `<button data-t="${t}" class="${t === cur ? 'active' : ''}">${label(t)}</button>`).join('')}</div>
-    <p class="muted small" style="margin-top:12px">Saved in this browser. <span class="mono">system</span> follows your OS light/dark preference.</p></div>`;
-  b.onclick = (e) => { const x = e.target.closest('[data-t]'); if (x) { setTheme(x.dataset.t); $$('[data-t]', b).forEach((y) => y.classList.toggle('active', y === x)); } };
+    <p class="muted small" style="margin-top:12px">Saved in this browser. <span class="mono">system</span> follows your OS light/dark preference.</p></div>
+    <div class="card section"><div class="card-title">${ICON.compass} Help &amp; onboarding</div>
+      <div class="row wrap"><button type="button" data-tour>${ICON.compass} Take the tour</button><button type="button" data-keys>${ICON.keyboard} Keyboard shortcuts</button><button type="button" data-checklist-reset>${ICON.check} Show setup checklist</button></div>
+      <p class="muted small" style="margin-top:12px">Press <kbd>Ctrl</kbd> <kbd>K</kbd> (<kbd>⌘</kbd> <kbd>K</kbd> on Mac) anywhere to search pages, containers and settings, or <kbd>?</kbd> for all shortcuts.</p></div>`;
+  b.onclick = (e) => {
+    if (e.target.closest('[data-tour]')) return Tour.start(true);
+    if (e.target.closest('[data-keys]')) return showShortcuts();
+    if (e.target.closest('[data-checklist-reset]')) { localStorage.removeItem(userKey('checklist-hidden')); toast('The setup checklist is back on Home'); return; }
+    const x = e.target.closest('[data-t]'); if (x) { setTheme(x.dataset.t); $$('[data-t]', b).forEach((y) => y.classList.toggle('active', y === x)); } };
 };
 
 Settings.power = (b) => {

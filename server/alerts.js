@@ -321,4 +321,4 @@ router.post('/test', wrap(async (req, res) => {
   res.json({ ok: true, results });
 }));
 
-module.exports = Object.assign(router, { init, tick, schedule, notify, fire });
+module.exports = Object.assign(router, { init, tick, schedule, notify, fire, recent: (n = 50) => history.slice(-n).reverse(), channelConfigured: () => !!channelConfigured(), isEnabled: () => !!state.enabled });

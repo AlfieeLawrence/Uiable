@@ -17,6 +17,7 @@ Uiable is a lightweight self-hosted Linux server dashboard (Docker). Pair it wit
 
 1. [Getting started](getting-started.md)
 2. [Install](install.md)
+   · [Using the interface](interface.md) (shortcuts, command palette, app store on/off)
 3. [Updates and releases](updates.md)
 4. Day-to-day: [Files](files.md) · [Metrics](metrics.md) · [Alerts](alerts.md) · [Backups](backups.md) · [Storage](storage.md) · [WireGuard](wireguard.md) · [Integrity](integrity.md)
 5. [Security and secrets](security.md)

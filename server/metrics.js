@@ -61,6 +61,9 @@ function openDb() {
       );
       CREATE INDEX IF NOT EXISTS idx_samples_t ON samples(t);
     `);
+    // 1.2.8: disk read/write rates (older databases get the columns added)
+    const cols = db.prepare('PRAGMA table_info(samples)').all().map((c) => c.name);
+    for (const c of ['dr', 'dw']) if (!cols.includes(c)) db.exec(`ALTER TABLE samples ADD COLUMN ${c} REAL`);
     backend = 'sqlite';
     return true;
   } catch (e) {
@@ -125,6 +128,9 @@ function start() {
 }
 function stop() { if (timer) { clearInterval(timer); timer = null; } }
 
+const num = (v) => (v == null || !Number.isFinite(Number(v)) ? null : Number(v));
+const COLS = ['cpu', 'mem', 'disk', 'rx', 'tx', 'temp', 'gpu', 'load1', 'dr', 'dw'];
+
 function sample() {
   return (async () => {
     if (backend === 'none') return;
@@ -136,8 +142,12 @@ function sample() {
       t: now,
       cpu: s.cpu && s.cpu.usage != null ? Number(s.cpu.usage) : null,
       mem: null, disk: null,
-      rx: s.network && s.network.rxSec != null ? Number(s.network.rxSec) : null,
-      tx: s.network && s.network.txSec != null ? Number(s.network.txSec) : null,
+      // stats.snapshot() reports rxRate/txRate (bytes/s); rxSec/txSec never existed, so
+      // before 1.2.8 network history was always empty.
+      rx: num(s.network && (s.network.rxRate ?? s.network.rxSec)),
+      tx: num(s.network && (s.network.txRate ?? s.network.txSec)),
+      dr: num(s.diskIo && s.diskIo.readRate),
+      dw: num(s.diskIo && s.diskIo.writeRate),
       temp: s.cpuTemp != null ? Number(s.cpuTemp) : null,
       gpu: s.gpu && s.gpu.util != null ? Number(s.gpu.util) : null,
       load1: Array.isArray(s.load) && s.load[0] != null ? Number(s.load[0]) : null,
@@ -152,8 +162,8 @@ function sample() {
       else if (pd.used != null && pd.size) row.disk = (Number(pd.used) / Number(pd.size)) * 100;
     }
     if (backend === 'sqlite' && db) {
-      db.prepare('INSERT OR REPLACE INTO samples (t,cpu,mem,disk,rx,tx,temp,gpu,load1) VALUES (?,?,?,?,?,?,?,?,?)')
-        .run(row.t, row.cpu, row.mem, row.disk, row.rx, row.tx, row.temp, row.gpu, row.load1);
+      db.prepare(`INSERT OR REPLACE INTO samples (t,${COLS.join(',')}) VALUES (?${',?'.repeat(COLS.length)})`)
+        .run(row.t, ...COLS.map((c) => (row[c] == null ? null : row[c])));
     } else if (backend === 'jsonl') {
       await fsp.appendFile(dayFile(now), JSON.stringify(row) + '\n', { mode: 0o600 });
     }
@@ -204,7 +214,7 @@ function readRangeJsonl(fromMs, toMs) {
 
 function readRange(fromMs, toMs) {
   if (backend === 'sqlite' && db) {
-    return db.prepare('SELECT t,cpu,mem,disk,rx,tx,temp,gpu,load1 FROM samples WHERE t >= ? AND t <= ? ORDER BY t ASC')
+    return db.prepare(`SELECT t,${COLS.join(',')} FROM samples WHERE t >= ? AND t <= ? ORDER BY t ASC`)
       .all(fromMs, toMs);
   }
   if (backend === 'jsonl') return readRangeJsonl(fromMs, toMs);
@@ -231,6 +241,63 @@ router.get('/history', wrap(async (req, res) => {
     retainDays: RETAIN_DAYS(), intervalSec: INTERVAL_MS() / 1000, backend,
     samples: rows,
   });
+}));
+
+// ---- Range view for the dashboard's expanded stat cards (1.2.8)
+const RANGES = { '1h': 1, '6h': 6, '24h': 24, '7d': 168 };
+const METRIC_KEYS = { cpu: ['cpu', 'load1'], mem: ['mem'], disk: ['disk', 'dr', 'dw'], net: ['rx', 'tx'], temp: ['temp'], gpu: ['gpu'] };
+
+/**
+ * Average `rows` into `buckets` equal time slots between fromMs and toMs. Each
+ * output point is { t, <key>: avg, <key>Min, <key>Max } (null where a slot has
+ * no data), plus a summary { min, avg, max, current, count } per key.
+ */
+function bucketize(rows, keys, fromMs, toMs, buckets) {
+  const n = Math.max(1, Math.min(1000, buckets | 0));
+  const span = Math.max(1, toMs - fromMs);
+  const slots = Array.from({ length: n }, (_, i) => ({ t: Math.round(fromMs + ((i + 0.5) * span) / n), acc: {} }));
+  const summary = {};
+  for (const k of keys) summary[k] = { min: null, max: null, avg: null, current: null, count: 0, sum: 0 };
+  for (const r of rows) {
+    if (r.t < fromMs || r.t > toMs) continue;
+    const i = Math.min(n - 1, Math.floor(((r.t - fromMs) / span) * n));
+    for (const k of keys) {
+      const v = r[k];
+      if (v == null || !Number.isFinite(Number(v))) continue;
+      const x = Number(v);
+      const a = slots[i].acc[k] || (slots[i].acc[k] = { sum: 0, n: 0, min: x, max: x });
+      a.sum += x; a.n += 1; a.min = Math.min(a.min, x); a.max = Math.max(a.max, x);
+      const s = summary[k];
+      s.min = s.min == null ? x : Math.min(s.min, x); s.max = s.max == null ? x : Math.max(s.max, x);
+      s.sum += x; s.count += 1; s.current = x;
+    }
+  }
+  const points = slots.map((sl) => {
+    const o = { t: sl.t };
+    for (const k of keys) { const a = sl.acc[k]; o[k] = a ? a.sum / a.n : null; o[k + 'Min'] = a ? a.min : null; o[k + 'Max'] = a ? a.max : null; }
+    return o;
+  });
+  for (const k of keys) { const s = summary[k]; s.avg = s.count ? s.sum / s.count : null; delete s.sum; }
+  return { points, summary };
+}
+
+/** Resolve ?range= against retention: { range, hours, clamped }. */
+function resolveRange(range, retainDays) {
+  const want = Object.prototype.hasOwnProperty.call(RANGES, range) ? range : '1h';
+  const maxH = retainDays * 24;
+  const hours = Math.min(RANGES[want], maxH);
+  return { range: want, hours, clamped: hours < RANGES[want] };
+}
+
+router.get('/range', wrap(async (req, res) => {
+  const metric = Object.prototype.hasOwnProperty.call(METRIC_KEYS, req.query.metric) ? req.query.metric : null;
+  if (!metric) throw bad('metric must be one of ' + Object.keys(METRIC_KEYS).join(', '));
+  const r = resolveRange(String(req.query.range || '1h'), RETAIN_DAYS());
+  const toMs = Date.now();
+  const fromMs = toMs - r.hours * 3600 * 1000;
+  const buckets = Math.min(600, Math.max(20, Number(req.query.points) || 240));
+  const out = bucketize(readRange(fromMs, toMs), METRIC_KEYS[metric], fromMs, toMs, buckets);
+  res.json(Object.assign({ metric, keys: METRIC_KEYS[metric], from: fromMs, to: toMs, retainDays: RETAIN_DAYS(), intervalSec: INTERVAL_MS() / 1000, backend, ranges: Object.keys(RANGES) }, r, out));
 }));
 
 router.get('/status', wrap(async (req, res) => {
@@ -263,4 +330,4 @@ router.put('/settings', wrap(async (req, res) => {
 
 router.post('/prune', wrap(async (req, res) => res.json(Object.assign({ ok: true }, prune()))));
 
-module.exports = Object.assign(router, { init, sample, prune, stop, RETAIN_DAYS });
+module.exports = Object.assign(router, { init, sample, prune, stop, RETAIN_DAYS, bucketize, resolveRange, RANGES, METRIC_KEYS, _readRange: (a, b) => readRange(a, b), _insert: (row) => { if (backend === 'sqlite' && db) db.prepare(`INSERT OR REPLACE INTO samples (t,${COLS.join(',')}) VALUES (?${',?'.repeat(COLS.length)})`).run(row.t, ...COLS.map((c) => (row[c] == null ? null : row[c]))); else if (backend === 'jsonl') fs.appendFileSync(dayFile(row.t), JSON.stringify(row) + '\n'); } });

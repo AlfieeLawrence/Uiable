@@ -64,6 +64,7 @@ app.get('/api/state', (req, res) => {
     displayName: s ? ((auth.findUser(s.username) || {}).displayName || '') : null,
     linuxUser: s ? ((auth.findUser(s.username) || {}).linuxUser || '') : null,
     needsBinding: s ? !!((auth.listUsers().find((a) => a.username === s.username) || {}).needsBinding) : false,
+    features: auth.features(),
     csrf: s ? s.csrf : null, version: VERSION, build: app.locals.BUILD, buildDate: BUILD_INFO.date, roles: auth.ROLE_NAMES,
   });
 });
@@ -142,6 +143,44 @@ api.get('/jobs/:id', (req, res) => {
 // Stats: any signed-in user
 api.get('/stats', wrap(async (req, res) => res.json(await stats.snapshot())));
 
+// -------- Optional features (1.2.8): the app store can be switched off
+api.get('/features', (req, res) => res.json(auth.features()));
+api.put('/features', auth.role('admin'), express.json(), (req, res) => {
+  const before = auth.features();
+  const out = auth.setFeatures(req.body || {});
+  audit.write({ user: req.session.username, role: req.session.role, ip: req.socket.remoteAddress, action: 'settings.features', ok: true, details: { from: JSON.stringify(before), to: JSON.stringify(out) } });
+  res.json(out);
+});
+const featureGate = (name, label) => (req, res, next) => (auth.features()[name] ? next() : res.status(404).json({ error: `${label} is turned off. An admin can turn it on in Settings → General → Features.`, reason: 'feature-off', feature: name }));
+
+// -------- Activity centre + setup checklist (1.2.8)
+const activity = require('./activity');
+api.get('/activity', wrap(async (req, res) => {
+  const isAdmin = auth.atLeast(req.session.role, 'admin');
+  const updates = require('./updates');
+  const a = await audit.search(isAdmin ? { limit: 60 } : { user: req.session.username, limit: 40 });
+  const items = activity.build({
+    audit: a.entries, alerts: isAdmin ? alerts.recent(30) : [], jobs: jobs.list(),
+    updates: isAdmin ? { self: updates.selfState, images: updates.imagesCached(), host: updates.hostCached() } : {},
+    user: req.session.username, isAdmin, limit: Math.min(100, Math.max(1, Number(req.query.limit) || 60)),
+  });
+  res.json({ items, now: Date.now() });
+}));
+api.get('/setup-checklist', wrap(async (req, res) => {
+  const isAdmin = auth.atLeast(req.session.role, 'admin');
+  const me = auth.listUsers().find((u) => u.username === req.session.username) || {};
+  const rec = auth.findUser(req.session.username) || {};
+  const updates = require('./updates');
+  const hostHdr = String(req.headers.host || '').replace(/:\d+$/, '').replace(/^\[|\]$/g, '');
+  const https = req.secure || req.headers['x-forwarded-proto'] === 'https' || ['localhost', '127.0.0.1', '::1'].includes(hostHdr);
+  const ic = updates.imagesCached(); const hc = updates.hostCached();
+  res.json(require('./checklist').compute({
+    isAdmin, twoFactor: me.twoFactor, linuxUser: me.linuxUser, bindSkipped: !!rec.bindSkipped, https,
+    backups: backup.profileCount(), alerts: alerts.channelConfigured() && alerts.isEnabled(),
+    updatesCheckedAt: Math.max(updates.selfState.at || 0, (ic && ic.checkedAt) || 0, (hc && hc.checkedAt) || 0) || null,
+  }));
+}));
+
 // -------- accounts (admin manages others; anyone manages own 2FA/password)
 api.get('/accounts', auth.role('admin'), (req, res) => res.json({ accounts: auth.listUsers(), me: req.session.username }));
 api.post('/accounts', auth.role('admin'), express.json(), wrap(async (req, res) => {
@@ -180,6 +219,31 @@ api.get('/account/linux-options', wrap(async (req, res) => {
   const isAdmin = auth.atLeast(req.session.role, 'admin');
   res.json({ users: (await lu.selectable(req.session)).map((u) => ({ name: u.name, uid: u.uid, home: u.home, admin: u.admin })), isAdmin, current: lu.boundOf(req.session), settings: auth.linuxSettings() });
 }));
+// Linking (or changing) a Linux user needs that Linux user's password, checked
+// against the host's /etc/shadow (server/linuxauth.js). Unlinking and re-saving
+// the same user don't. The password is never logged, stored or returned.
+const linuxauth = require('./linuxauth');
+const linkLimiter = linuxauth.createLimiter();
+async function verifyLinuxLink(req, res, account, name, current) {
+  if (!name || name === current) return true;
+  const actor = req.session.username;
+  const limited = linkLimiter.check(actor, name);
+  const vAudit = (ok, reason) => audit.write({ user: actor, role: req.session.role, ip: req.socket.remoteAddress, action: 'account.linux-verify', ok, details: { account, target: name, self: account === actor, reason } });
+  if (limited) {
+    vAudit(false, 'rate-limited');
+    res.set('Retry-After', String(limited.retryAfter));
+    res.status(429).json({ error: `Too many wrong passwords for Linux user ${name}. Try again in ${Math.ceil(limited.retryAfter / 60)} min.`, reason: 'rate-limited', retryAfter: limited.retryAfter });
+    return false;
+  }
+  const v = await linuxauth.verify(name, typeof req.body.password === 'string' ? req.body.password : '');
+  if (v.ok) { linkLimiter.success(actor, name); vAudit(true, 'verified'); return true; }
+  const counts = v.reason === 'wrong' || v.reason === 'invalid';
+  const remaining = counts ? linkLimiter.fail(actor, name) : undefined;
+  vAudit(false, v.reason);
+  const status = v.reason === 'wrong' ? 403 : v.reason === 'unavailable' ? 503 : 400;
+  res.status(status).json({ error: v.message + (v.reason === 'wrong' && remaining <= 2 ? ` ${remaining} attempt${remaining === 1 ? '' : 's'} left before a 15 min lockout.` : ''), reason: v.reason, ...(remaining !== undefined ? { remaining } : {}) });
+  return false;
+}
 api.post('/account/linux-user', express.json(), wrap(async (req, res) => {
   if (req.body.skip) { auth.setLinuxUser(req.session.username, '', { skip: true }); return res.json({ ok: true, skipped: true }); }
   const name = String(req.body.linuxUser || '');
@@ -187,16 +251,19 @@ api.post('/account/linux-user', express.json(), wrap(async (req, res) => {
     const ok = (await lu.selectable(req.session)).some((u) => u.name === name);
     if (!ok) return res.status(403).json({ error: 'You are not allowed to link to that Linux user. Ask an admin to add it to the allowed list.' });
   }
+  if (!(await verifyLinuxLink(req, res, req.session.username, name, lu.boundOf(req.session)))) return;
   const r = auth.setLinuxUser(req.session.username, name);
-  bindAudit(req, req.session.username, r, { self: true });
+  bindAudit(req, req.session.username, r, { self: true, verified: !!name && r.before !== name });
   res.json({ ok: true, linuxUser: r.after });
 }));
 api.post('/accounts/:name/linux-user', auth.role('admin'), express.json(), wrap(async (req, res) => {
   const name = String(req.body.linuxUser || '');
   if (name) await lu.get(name);
   const acct = auth.findUser(req.params.name); if (!acct) return res.status(404).json({ error: 'No such account' });
+  // Admins linking another account still need the target Linux user's password.
+  if (!(await verifyLinuxLink(req, res, acct.username, name, acct.linuxUser || ''))) return;
   const r = auth.setLinuxUser(acct.username, name);
-  bindAudit(req, acct.username, r, { self: false });
+  bindAudit(req, acct.username, r, { self: false, verified: !!name && r.before !== name });
   res.json({ ok: true, linuxUser: r.after });
 }));
 api.get('/accounts-linux-settings', auth.role('admin'), wrap(async (req, res) => res.json(Object.assign({ users: await lu.list() }, auth.linuxSettings()))));
@@ -277,7 +344,29 @@ api.get('/docker/status', wrap(async (req, res) => {
 api.get('/docker/containers', wrap(async (req, res) => res.json({ containers: await docker.containers(), self: process.env.HOSTNAME || '' })));
 api.get('/docker/containers/:id/logs', wrap(async (req, res) => res.json({ logs: await docker.logs(req.params.id, Number(req.query.tail) || 500) })));
 api.get('/docker/containers/:id/stats', wrap(async (req, res) => res.json(await docker.stats(req.params.id))));
-api.get('/docker/containers/:id/inspect', wrap(async (req, res) => res.json(await docker.inspect(req.params.id))));
+// Non-admins get secret env values masked (they used to see them in full here).
+api.get('/docker/containers/:id/inspect', wrap(async (req, res) => {
+  if (auth.atLeast(req.session.role, 'admin')) return res.json(await docker.inspect(req.params.id));
+  res.json((await docker.detail(req.params.id)).inspect);
+}));
+// Container page: inspect with secrets masked; admins may ask for ?reveal=1 (audit-logged).
+api.get('/docker/containers/:id/detail', wrap(async (req, res) => {
+  const isAdmin = auth.atLeast(req.session.role, 'admin');
+  const reveal = isAdmin && req.query.reveal === '1';
+  if (reveal) audit.write({ user: req.session.username, role: req.session.role, ip: req.socket.remoteAddress, action: 'docker.env.reveal', ok: true, details: { id: String(req.params.id).slice(0, 64) } });
+  const d = await docker.detail(req.params.id, { reveal });
+  res.json(Object.assign(d, { canReveal: isAdmin, revealed: reveal }));
+}));
+api.get('/docker/stats-summary', wrap(async (req, res) => res.json(await docker.statsAll())));
+// One-click redeploy: pull the latest image (optional) and recreate with the same settings.
+api.post('/docker/containers/:id/recreate', express.json(), wrap(async (req, res) => {
+  const pull = !(req.body && req.body.pull === false);
+  const cid = req.params.id;
+  const insp = await docker.inspect(cid);
+  const name = String(insp.Name || cid).replace(/^\//, '');
+  const job = jobs.runFn(`${pull ? 'Redeploy' : 'Recreate'} ${name}`, req.session.username, (log) => docker.recreate(cid, { pull, log, runHost: host.run }));
+  res.json({ ok: true, job: jobs.view(job) });
+}));
 api.post('/docker/containers/:id/:action', wrap(async (req, res) => { await docker.action(req.params.id, req.params.action); res.json({ ok: true }); }));
 api.delete('/docker/containers/:id', wrap(async (req, res) => { await docker.remove(req.params.id); res.json({ ok: true }); }));
 api.get('/docker/images', wrap(async (req, res) => res.json({ images: await docker.images() })));
@@ -319,7 +408,7 @@ api.use('/integrity', auth.role('admin'), integrity);
 api.use('/wireguard', auth.role('admin'), wireguard);
 
 api.use('/alerts', auth.role('admin'), alerts);
-api.use('/apps', auth.rw('viewer', 'operator'), require('./apps'));
+api.use('/apps', featureGate('store', 'The app store'), auth.rw('viewer', 'operator'), require('./apps'));
 api.use('/stacks', auth.rw('viewer', 'operator'), require('./compose'));
 api.use('/storage', (req, res, next) => {
   if (['GET', 'HEAD'].includes(req.method)) return auth.role('viewer')(req, res, next);

@@ -185,4 +185,4 @@ router.get('/:id/snapshots', wrap(async (req, res) => {
   res.json({ available: true, snapshots });
 }));
 
-module.exports = Object.assign(router, { init });
+module.exports = Object.assign(router, { init, profileCount: () => ((state && state.profiles) || []).length });

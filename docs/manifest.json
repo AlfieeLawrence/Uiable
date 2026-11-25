@@ -1,6 +1,6 @@
 {
   "name": "Uiable",
-  "versionHint": "1.2.7",
+  "versionHint": "1.2.8",
   "repository": "https://github.com/AlfieeLawrence/uiable",
   "releases": "https://github.com/AlfieeLawrence/uiable/releases",
   "companion": "https://github.com/AlfieeLawrence/Uiable-Connect",
@@ -21,6 +21,13 @@
       "path": "docs/getting-started.md"
     },
     {
+      "title": "Using the interface",
+      "description": "Command palette, keyboard shortcuts, notifications, container pages, undo, phone layout, onboarding and turning the app store on or off.",
+      "order": 5,
+      "slug": "interface",
+      "path": "docs/interface.md"
+    },
+    {
       "title": "Install",
       "description": "Installer, Compose, bare metal, ports, and Umbrel notes.",
       "order": 10,
@@ -36,7 +43,7 @@
     },
     {
       "title": "Security and secrets",
-      "description": "Password redaction, encrypted secrets.env.enc, API tokens, roles.",
+      "description": "Password redaction, encrypted secrets.env.enc, API tokens, roles, Linux account linking.",
       "order": 20,
       "slug": "security",
       "path": "docs/security.md"

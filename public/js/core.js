@@ -3,7 +3,8 @@
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => Array.from(r.querySelectorAll(s));
 const esc = (s) => String(s == null ? '' : s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-const State = { csrf: null, user: null, role: null, version: '' };
+const State = { csrf: null, user: null, role: null, version: '', features: { store: true } };
+const reducedMotion = () => matchMedia('(prefers-reduced-motion: reduce)').matches;
 
 function splitBytes(n, d = 1) {
   n = Number(n) || 0;
@@ -54,12 +55,29 @@ const POST = (u, b) => api('POST', u, b === undefined ? {} : b);
 const DEL = (u) => api('DELETE', u);
 const PUT = (u, b) => api('PUT', u, b);
 
-function toast(msg, isErr) {
+/**
+ * Toast. opts: { action: { label, fn }, timeout, onTimeout, html } -> { close, el }.
+ * Same look as Uiable Connect (accent stripe, dismiss ✕); polite live region for screen readers.
+ */
+function toast(msg, isErr, opts = {}) {
+  const root = $('#toasts');
   const t = document.createElement('div');
-  t.className = 'toast' + (isErr ? ' err' : '');
-  t.textContent = msg;
-  $('#toasts').appendChild(t);
-  setTimeout(() => { t.style.transition = 'opacity .3s'; t.style.opacity = 0; setTimeout(() => t.remove(), 300); }, isErr ? 6000 : 3000);
+  t.className = 'toast' + (isErr ? ' err' : '') + (opts.action ? ' has-act' : '');
+  t.setAttribute('role', isErr ? 'alert' : 'status');
+  t.innerHTML = `<span class="toast-msg"></span>${opts.action ? `<button type="button" class="toast-act">${esc(opts.action.label)}</button>` : ''}<button type="button" class="toast-x" aria-label="Dismiss notification">${ICON.x}</button>`;
+  $('.toast-msg', t).textContent = msg;
+  if (opts.timeout && opts.progress !== false) { const bar = document.createElement('i'); bar.className = 'toast-bar'; bar.style.animationDuration = opts.timeout + 'ms'; t.appendChild(bar); }
+  root.appendChild(t);
+  let timer = null; let closed = false;
+  const close = (why) => {
+    if (closed) return; closed = true; clearTimeout(timer);
+    t.classList.add('out'); setTimeout(() => t.remove(), reducedMotion() ? 0 : 200);
+    if (why === 'timeout' && opts.onTimeout) opts.onTimeout();
+  };
+  $('.toast-x', t).onclick = () => close(opts.dismissRunsTimeout ? 'timeout' : 'x');
+  if (opts.action) $('.toast-act', t).onclick = () => { try { opts.action.fn(); } finally { close('action'); } };
+  timer = setTimeout(() => close('timeout'), opts.timeout || (isErr ? 6000 : 3500));
+  return { close, el: t };
 }
 const toastErr = (e) => toast(e && e.message ? e.message : String(e), true);
 
@@ -86,16 +104,36 @@ function unlockScroll() {
   window.scrollTo(0, lockedY);
 }
 function closeAllModals() { [...openModals].forEach((c) => c(null)); }
-function modal({ title, body = '', wide, full, log, buttons = [{ label: 'Close', value: null }], onOpen, dismissable = true }) {
+function modal({ title, body = '', wide, full, log, cls, buttons = [{ label: 'Close', value: null }], onOpen, dismissable = true }) {
   return new Promise((resolve) => {
     const bg = document.createElement('div');
     bg.className = 'modal-bg';
-    bg.innerHTML = `<div class="modal ${wide ? 'wide' : ''} ${full ? 'wide full' : ''} ${log ? 'has-log' : ''}"><header><h2 class="grow ellipsis">${esc(title)}</h2><button class="icon" data-x>${ICON.x}</button></header><div class="body">${body}</div><footer>${buttons.map((b, i) => `<button data-i="${i}" class="${b.cls || ''}">${esc(b.label)}</button>`).join('')}</footer></div>`;
+    const hid = 'mh' + Math.random().toString(36).slice(2, 8);
+    bg.innerHTML = `<div class="modal ${wide ? 'wide' : ''} ${full ? 'wide full' : ''} ${log ? 'has-log' : ''} ${cls || ''}" role="dialog" aria-modal="true" aria-labelledby="${hid}"><header><h2 class="grow ellipsis" id="${hid}">${esc(title)}</h2><button class="icon" data-x aria-label="Close dialog" title="Close (Esc)">${ICON.x}</button></header><div class="body">${body}</div>${buttons.length ? `<footer>${buttons.map((b, i) => `<button type="button" data-i="${i}" class="${b.cls || ''}">${esc(b.label)}</button>`).join('')}</footer>` : ''}</div>`;
     const m = bg.firstChild;
+    const prevFocus = document.activeElement;
     let cleanup = null;
-    const close = (v) => { if (!openModals.has(close)) return; openModals.delete(close); if (cleanup) cleanup(); bg.remove(); unlockScroll(); document.removeEventListener('keydown', onKey); resolve(v); };
+    const close = (v) => { if (!openModals.has(close)) return; openModals.delete(close); if (cleanup) cleanup(); bg.remove(); unlockScroll(); document.removeEventListener('keydown', onKey); if (prevFocus && prevFocus.isConnected && prevFocus.focus) { try { prevFocus.focus({ preventScroll: true }); } catch (_) {} } resolve(v); };
     openModals.add(close); lockScroll();
-    const onKey = (e) => { if (e.key === 'Escape' && dismissable) close(null); };
+    const onKey = (e) => {
+      if ([...openModals].pop() !== close) return; // only the top dialog reacts
+      if (e.key === 'Escape' && dismissable) { e.stopPropagation(); close(null); }
+      if (e.key === 'Tab') { // keep focus inside the dialog
+        const f = $$('button:not([disabled]), [href], input:not([type=hidden]):not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])', m).filter((x) => x.offsetParent !== null);
+        if (!f.length) return;
+        const first = f[0], last = f[f.length - 1];
+        if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+        else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+      }
+    };
+    // Phones: drag the header down to dismiss
+    if (dismissable) {
+      let y0 = null;
+      const hd = $('header', m);
+      hd.addEventListener('touchstart', (e) => { y0 = e.touches[0].clientY; }, { passive: true });
+      hd.addEventListener('touchmove', (e) => { if (y0 == null) return; const dy = Math.max(0, e.touches[0].clientY - y0); m.style.transform = `translateY(${dy}px)`; m.style.transition = 'none'; }, { passive: true });
+      hd.addEventListener('touchend', (e) => { if (y0 == null) return; const dy = (e.changedTouches[0].clientY - y0); y0 = null; m.style.transition = ''; m.style.transform = ''; if (dy > 90) close(null); });
+    }
     document.addEventListener('keydown', onKey);
     bg.addEventListener('mousedown', (e) => { if (e.target === bg && dismissable) close(null); });
     $('[data-x]', m).onclick = () => close(null);
@@ -108,7 +146,7 @@ function modal({ title, body = '', wide, full, log, buttons = [{ label: 'Close',
     });
     $('#modal-root').appendChild(bg);
     if (onOpen) cleanup = onOpen(m, close) || null;
-    const f = $('input:not([type=checkbox]), textarea, select', m);
+    const f = $('[autofocus], input:not([type=checkbox]), textarea, select', m) || $('footer button.primary', m) || $('[data-x]', m);
     if (f) setTimeout(() => f.focus(), 30);
     $$('input', m).forEach((i) => i.addEventListener('keydown', (e) => { if (e.key === 'Enter') { const p = $('footer button.primary, footer button.danger.solid', m); if (p) p.click(); } }));
   });
@@ -215,7 +253,11 @@ const APPS = [
   { id: 'audit', name: 'Audit log', icon: 'logs', bg: 'linear-gradient(135deg,#78716c,#57534e)', role: 'admin' },
   { id: 'settings', name: 'Settings', icon: 'settings', bg: 'linear-gradient(135deg,#64748b,#94a3b8)', role: 'viewer' },
 ];
-const visibleApps = () => APPS.filter((a) => can(a.role));
+// Optional features hide their app everywhere (home, dock, launcher, palette); the server blocks the API too.
+const APP_FEATURE = { apps: 'store' };
+const featureOn = (f) => !State.features || State.features[f] !== false;
+const appEnabled = (a) => !APP_FEATURE[a.id] || featureOn(APP_FEATURE[a.id]);
+const visibleApps = () => APPS.filter((a) => can(a.role) && appEnabled(a));
 const ctrColor = (s) => { let h = 0; for (const c of s) h = (h * 31 + c.charCodeAt(0)) % 360; return `linear-gradient(135deg,hsl(${h},70%,55%),hsl(${(h + 40) % 360},70%,45%))`; };
 const appIcon = (a, cls = '') => `<div class="app-icon ${cls}" style="background:${a.bg}">${ICON[a.icon]}</div>`;
 
@@ -306,7 +348,7 @@ const bar = (pct) => `<div class="bar ${pctClass(pct)}"><i style="width:${Math.m
 const Pages = {};
 // Each app's JS (and xterm for the terminal) is fetched only the first time it is opened.
 const PAGE_ASSETS = {
-  processes: ['/js/sys.js'], services: ['/js/sys.js'], docker: ['/js/docker.js'], files: ['/js/files.js'], settings: ['/js/settings.js'],
+  processes: ['/js/sys.js'], services: ['/js/sys.js'], docker: ['/js/docker.js', '/js/container.js'], files: ['/js/files.js'], settings: ['/js/settings.js'],
   terminal: ['/vendor/xterm/css/xterm.css', '/vendor/xterm/lib/xterm.js', '/vendor/xterm-fit/lib/addon-fit.js', '/js/terminal.js'],
   apps: ['/js/apps.js'], scripts: ['/js/scripts.js'], stacks: ['/js/stacks.js'], logs: ['/js/logs.js'], storage: ['/js/storage.js'],
   updates: ['/js/updates.js'], firewall: ['/js/firewall.js'], cron: ['/js/cron.js'], proxy: ['/js/proxy.js'],
@@ -347,17 +389,19 @@ async function route() {
   let page = Pages[want] ? want : (Pages[name] ? name : 'home');
   const appDef = APPS.find((a) => a.id === page);
   if (appDef && !can(appDef.role)) { toast('Your role cannot open that app', true); page = 'home'; }
+  if (appDef && !appEnabled(appDef)) { toast(`${appDef.name} is turned off (Settings → General → Features)`, true); page = 'home'; history.replaceState(null, '', '#/'); }
   closeAllModals(); document.querySelectorAll('.ctx').forEach((c) => c.remove());
   if (currentCleanup) { try { currentCleanup(); } catch (_) {} currentCleanup = null; }
   const app = APPS.find((a) => a.id === page);
   const root = $('#app');
-  root.innerHTML = `<div class="page">${page === 'home' || page === 'launcher' ? '' : `
+  root.innerHTML = `<a class="skip-link" href="#view" data-skip>Skip to content</a><div class="page">${page === 'home' || page === 'launcher' ? '' : `
     <div class="topbar">
-      <a href="#/" class="btn icon" title="Home">${ICON.back}</a>
-      <div class="title">${appIcon(app)}<h1 style="font-size:24px">${esc(app.name)}</h1></div>
-      <div class="spacer"></div><div id="page-actions" class="row"></div>
-    </div>`}<div id="view"></div></div>${dockHtml(page)}`;
+      <a href="#/" class="btn icon" title="Home (g h)" aria-label="Back to home">${ICON.back}</a>
+      <div class="title">${appIcon(app)}<h1>${esc(app.name)}</h1></div>
+      <div class="spacer"></div><div id="page-actions" class="row"></div>${typeof topActionsHtml === 'function' ? topActionsHtml() : ''}
+    </div>`}<main id="view" tabindex="-1"></main></div>${dockHtml(page)}${typeof tabbarHtml === 'function' ? tabbarHtml(page) : ''}`;
   bindDock();
+  if (typeof afterRoute === 'function') afterRoute(page);
   currentCleanup = Pages[page]($('#view'), rest.map(decodeURIComponent)) || null;
 }
 function dockItemIcon(d) {
@@ -366,7 +410,7 @@ function dockItemIcon(d) {
   if (d.type === 'theme') return { bg: 'var(--input)', html: document.documentElement.dataset.theme === 'light' ? ICON.moon : ICON.sun, tip: 'Theme · ' + getTheme(), href: '#', theme: true, color: 'var(--text)' };
   if (d.type === 'app') {
     const a = APPS.find((x) => x.id === d.app);
-    if (!a || !can(a.role)) return null;
+    if (!a || !can(a.role) || !appEnabled(a)) return null;
     return { bg: d.color || a.bg, html: d.icon ? (ICON[d.icon] || `<img class="tile-ic-img pack" src="/icons/pack/${esc(d.icon)}.svg" alt="">`) : ICON[a.icon], tip: d.name || a.name, href: '#/' + a.id };
   }
   if (d.type === 'folder') return { bg: d.color || 'linear-gradient(135deg,#3b82f6,#22c1c3)', html: ICON.folder, tip: d.name || d.path || 'Files', href: '#/files/' + String(d.path || '/').replace(/^\//, '') };
@@ -390,9 +434,10 @@ function dockHtml(active) {
     const extra = it.theme ? ' data-theme-toggle' : '';
     const script = it.script ? ` data-dock-script="${esc(it.script)}"` : '';
     const ext = it.external ? ` data-ext="${esc(it.href)}" href="#"` : ` href="${esc(it.href)}"`;
-    parts.push(`<a class="${activeCls}"${ext}${extra}${script}><div class="app-icon" style="background:${it.bg};${it.color ? 'color:'+it.color : ''}">${it.html}</div><span class="tip">${esc(it.tip)}</span></a>`);
+    const dot = d.type === 'app' && d.app === 'docker' ? '<span class="dock-dot" data-dock-health aria-hidden="true"></span>' : '';
+    parts.push(`<a class="${activeCls}"${ext}${extra}${script} aria-label="${esc(it.tip)}"${activeCls ? ' aria-current="page"' : ''}><div class="app-icon" style="background:${it.bg};${it.color ? 'color:'+it.color : ''}">${it.html}</div>${dot}<span class="tip" aria-hidden="true">${esc(it.tip)}</span></a>`);
   });
-  return `<nav class="dock">${parts.join('')}</nav>`;
+  return `<nav class="dock" aria-label="Dock">${parts.join('')}</nav>`;
 }
 function bindDock() {
   const t = $('[data-theme-toggle]');
@@ -520,22 +565,55 @@ const linuxUserOptionsHtml = (users, selected, { allowNone } = {}) =>
   (allowNone ? `<option value="" ${!selected ? 'selected' : ''}>— not linked —</option>` : '') +
   users.map((u) => `<option value="${esc(u.name)}" ${u.name === selected ? 'selected' : ''}>${esc(u.name)}${u.uid === 0 ? ' (root)' : ` (uid ${u.uid})`}${u.admin && u.uid !== 0 ? ' · sudo' : ''}</option>`).join('');
 
+/* Linking needs the chosen Linux user's own password (checked on the server against
+   /etc/shadow). Unlinking, or keeping the current user, doesn't. Shared by the first-login,
+   My account and admin "Linux user" dialogs. */
+const linuxLinkFields = (users, selected, { allowNone } = {}) =>
+  `<label class="field"><span>Linux user</span><select name="lu">${linuxUserOptionsHtml(users, selected, { allowNone })}</select></label>
+   <div data-lu-pw hidden><label class="field"><span>Password for Linux user <b class="mono" data-lu-name></b></span><input name="lupw" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" maxlength="1024" placeholder="Their Linux login password"></label>
+     <p class="muted small" style="margin-top:-4px">Proves this Linux account is yours to link. Checked against the server's /etc/shadow; never stored or logged. 5 wrong tries locks this for 15 minutes.</p></div>
+   <div class="notice err" data-lu-err role="alert" hidden></div>`;
+function linuxLinkWire(m, current, labels = {}) {
+  const sel = $('[name=lu]', m), pw = $('[name=lupw]', m), err = $('[data-lu-err]', m), btn = $('footer button.primary', m);
+  const sync = () => {
+    const v = sel.value, need = !!v && v !== current;
+    $('[data-lu-pw]', m).hidden = !need; $('[data-lu-name]', m).textContent = v;
+    if (btn) btn.textContent = need ? 'Verify & link' : !v && current ? 'Unlink' : (labels.same || 'Save');
+    err.hidden = true; err.textContent = ''; pw.value = '';
+    if (need) setTimeout(() => pw.focus(), 60);
+  };
+  sel.addEventListener('change', sync); sync();
+}
+async function linuxLinkSubmit(m, url, current) {
+  const sel = $('[name=lu]', m), pw = $('[name=lupw]', m), err = $('[data-lu-err]', m);
+  const v = sel.value, need = !!v && v !== current;
+  const show = (msg) => { err.textContent = msg; err.hidden = false; pw.value = ''; if (need) pw.focus(); return false; };
+  if (need && !pw.value) return show(`Type the Linux password for ${v} to link it.`);
+  try {
+    await POST(url, need ? { linuxUser: v, password: pw.value } : { linuxUser: v });
+    pw.value = '';
+    return 'ok';
+  } catch (e) { return show(e.message || 'Could not link that Linux user'); }
+}
+
 /** Pick a Linux user to link the current account to. Used on first login and in My account. */
 async function linuxBindDlg({ firstLogin } = {}) {
   const o = await linuxOptions(true);
   const users = o.users;
-  const pre = o.current || o.settings.defaultUser || '';
+  const current = o.current || '';
+  const pre = current || o.settings.defaultUser || '';
   const none = !users.length;
   const r = await modal({
     title: firstLogin ? 'Link your Linux account' : 'Linked Linux user',
-    body: `<p class="muted">${firstLogin ? `Welcome, <b>${esc(State.displayName || State.user)}</b>. ` : ''}Choose which Linux user on this server is yours. It becomes the default for new terminal tabs, the user scripts run as, and the owner of files you upload into its home folder.</p>
+    body: `<p class="muted">${firstLogin ? `Welcome, <b>${esc(State.displayName || State.user)}</b>. ` : ''}Choose which Linux user on this server is yours, then type its Linux password to prove it. It becomes the default for new terminal tabs, the user scripts run as, and the owner of files you upload into its home folder.</p>
       ${none ? `<div class="notice">${o.isAdmin ? 'No Linux users with uid 1000 or above were found.' : 'An admin has not allowed any Linux users for self-linking yet. You can skip this and ask an admin to link your account.'}</div>`
-      : `<label class="field"><span>Linux user</span><select name="lu">${linuxUserOptionsHtml(users, pre, { allowNone: !firstLogin })}</select></label>
+      : `${linuxLinkFields(users, pre, { allowNone: !firstLogin })}
          <p class="muted small">${o.isAdmin ? 'As an admin you can pick any user, including root, and still choose a different user per terminal tab or script.' : 'You can only pick from the users an admin has approved, and you will always run as this user.'}</p>`}
-      <p class="muted small">You can change this later in Settings → My account. Changes are audit-logged.</p>`,
+      <p class="muted small">You can change this later in Settings → My account (changing it asks for the new user's password again). Changes are audit-logged.</p>`,
     dismissable: !firstLogin,
+    onOpen: none ? undefined : (m) => { linuxLinkWire(m, current); },
     buttons: [{ label: firstLogin ? 'Skip for now' : 'Cancel', value: firstLogin ? 'skip' : null },
-      ...(none ? [] : [{ label: firstLogin ? 'Link account' : 'Save', cls: 'primary', handler: async (m) => { await POST('/account/linux-user', { linuxUser: $('[name=lu]', m).value }); return 'ok'; }, keepOpenOnError: true }])],
+      ...(none ? [] : [{ label: 'Verify & link', cls: 'primary', handler: (m) => linuxLinkSubmit(m, '/account/linux-user', current) }])],
   });
   if (r === 'skip') { await POST('/account/linux-user', { skip: true }).catch(() => {}); }
   const st = await GET('/state'); State.linuxUser = st.linuxUser || ''; _linuxOpts = null;

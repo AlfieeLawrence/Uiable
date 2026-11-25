@@ -7,6 +7,8 @@ const Home = {
   wcache: {}, // tile id -> last rendered widget HTML (shown dimmed in edit mode)
 };
 
+// Home widgets that open the full-detail stat view when clicked
+const HOME_EXPAND = { cpu: 'cpu', mem: 'mem', disk: 'disk', net: 'net', storage: 'disk', temp: 'temp', gpu: 'gpu' };
 const TILE_COLORS = ['#7c5cff', '#22c1c3', '#3b82f6', '#f59e0b', '#ef4444', '#10b981', '#0ea5e9', '#f472b6', '#64748b', '#a855f7'];
 
 function tileSizeKey(t) { return `${t.w || 1}x${t.h || 1}`; }
@@ -18,7 +20,7 @@ function tileIconHtml(t, fallbackApp) {
   if ((kind === 'pack' || !kind) && t.icon && !t.icon.startsWith('/')) {
     // pack icon or legacy ICON key
     if (ICON[t.icon]) return ICON[t.icon];
-    return `<img class="tile-ic-img pack" src="/icons/pack/${esc(t.icon)}.svg" alt="" onerror="this.style.display='none'">`;
+    return `<img class="tile-ic-img pack" src="/icons/pack/${esc(t.icon)}.svg" alt="" data-hide-broken>`;
   }
   if (fallbackApp && ICON[fallbackApp.icon]) return ICON[fallbackApp.icon];
   if (t.type === 'folder') return ICON.folder;
@@ -73,7 +75,9 @@ function renderTile(t) {
   const cls = `home-tile size-${w}x${h} ${isWidget ? 'is-widget' : 'is-shortcut'} ${disabled ? 'disabled' : ''} ${Home.editing ? 'editing' : ''}`;
   const style = `grid-column: span ${w}; grid-row: span ${h}; --tile:${esc(bg)}`;
   if (isWidget) {
-    return `<div class="${cls}" style="${style}" data-tid="${esc(t.id)}" data-type="widget" data-widget="${esc(t.widget)}">
+    const exp = HOME_EXPAND[t.widget];
+    const a11y = exp && !Home.editing ? ` role="button" tabindex="0" data-stat="${exp}" aria-label="${esc(name)}: open full details" title="Open full details"` : '';
+    return `<div class="${cls}${exp ? ' expandable' : ''}" style="${style}" data-tid="${esc(t.id)}" data-type="widget" data-widget="${esc(t.widget)}"${a11y}>
       <div class="tile-chrome">${mq(name, 'tile-name')}</div>
       <div class="tile-body" data-wbody="${esc(t.id)}">${Home.wcache[t.id] || '<span class="muted small">…</span>'}</div>
     </div>`;
@@ -95,8 +99,8 @@ function paintHomeGrid(root, layout) {
   const grid = $('[data-home-grid]', root);
   if (!grid) return;
   // Tiles for apps that no longer exist (old layouts) are hidden; edit mode still shows them so they can be removed
-  const tiles = sortTiles(layout.tiles || []).filter((t) => Home.editing || t.type !== 'app' || APPS.some((a) => a.id === t.app));
-  grid.innerHTML = tiles.map(renderTile).join('') || `<div class="empty">Your home is empty. Tap the pencil to add tiles.</div>`;
+  const tiles = sortTiles(layout.tiles || []).filter((t) => Home.editing || t.type !== 'app' || APPS.some((a) => a.id === t.app && appEnabled(a)));
+  grid.innerHTML = tiles.map(renderTile).join('') || emptyState({ icon: 'grid', title: 'Your home is empty', text: 'Add live widgets (CPU, memory, containers…) and shortcuts to the apps you use most.', actions: [{ label: 'Customise home', attr: 'data-edit-empty', primary: true, icon: 'edit' }, { label: 'All apps', href: '#/launcher' }] });
 }
 
 function bindVisibleWidgets(root) {
@@ -110,12 +114,12 @@ function bindVisibleWidgets(root) {
     widgetEls.forEach((el) => {
       if (el.dataset.off === '1') return;
       const w = el.dataset.widget;
-      if (w === 'cpu') fill(el, `<div class="tile-val num">${fmtPct(d.cpu.usage, 0)}</div><div class="muted small">load ${d.load.map((x) => fmtNum(x, 2)).join(' ')}</div>`);
-      else if (w === 'mem') fill(el, `<div class="tile-val num">${fmtBytes(d.memory.used)}</div><div class="muted small">of ${fmtBytes(d.memory.total)}</div>${bar(d.memory.total ? (d.memory.used / d.memory.total) * 100 : 0)}`);
+      if (w === 'cpu') { fill(el, `<div class="tile-val num">${fmtPct(d.cpu.usage, 0)}</div><div class="muted small">load ${d.load.map((x) => fmtNum(x, 2)).join(' ')}${d.cpuTemp != null ? ` · ${fmtNum(d.cpuTemp, 0)}°C` : ''}</div><canvas class="spark tile-spark"></canvas>`); sparkline(el.querySelector('.tile-spark'), [Stats.history.cpu], { max: 100 }); }
+      else if (w === 'mem') { fill(el, `<div class="tile-val num">${fmtBytes(d.memory.used)}</div><div class="muted small">of ${fmtBytes(d.memory.total)}</div>${bar(d.memory.total ? (d.memory.used / d.memory.total) * 100 : 0)}<canvas class="spark tile-spark"></canvas>`); sparkline(el.querySelector('.tile-spark'), [Stats.history.mem], { max: 100, colors: ['#22c1c3'] }); }
       else if (w === 'disk') {
         const root0 = d.primaryDisk || d.disks[0];
         fill(el, root0 ? `<div class="tile-val num">${fmtBytes(root0.used)}</div><div class="muted small ellipsis">of ${fmtBytes(root0.size)} on ${esc(root0.mount)}</div>${bar((root0.used / root0.size) * 100)}` : 'n/a');
-      } else if (w === 'net') fill(el, `<div class="tile-net"><div><span class="muted small">↓</span> <span class="num">${fmtRate(d.network.rxRate)}</span></div><div><span class="muted small">↑</span> <span class="num">${fmtRate(d.network.txRate)}</span></div></div>`);
+      } else if (w === 'net') { fill(el, `<div class="tile-net"><div><span class="muted small">↓</span> <span class="num">${fmtRate(d.network.rxRate)}</span></div><div><span class="muted small">↑</span> <span class="num">${fmtRate(d.network.txRate)}</span></div></div><canvas class="spark tile-spark"></canvas>`); sparkline(el.querySelector('.tile-spark'), [Stats.history.rx, Stats.history.tx], { colors: ['#7c5cff', '#f472b6'] }); }
       else if (w === 'uptime') fill(el, `<div class="tile-val">${fmtDur(d.uptime)}</div><div class="muted small ellipsis">${esc(d.info.hostname)}</div>`);
       else if (w === 'clock') {
         const now = new Date();
@@ -243,8 +247,8 @@ async function activateTile(t) {
       const buttons = [{ label: 'Close', value: null }];
       if (can('operator')) {
         if (running) {
-          buttons.push({ label: 'Stop', cls: 'danger', handler: async () => { await POST('/docker/containers/' + c.Id + '/stop'); toast('Stopped'); return true; } });
-          buttons.push({ label: 'Restart', handler: async () => { await POST('/docker/containers/' + c.Id + '/restart'); toast('Restarted'); return true; } });
+          buttons.push({ label: 'Stop', cls: 'danger', value: () => { ctrAction(c.Id, name.replace(/^\//, ''), 'stop'); return true; } });
+          buttons.push({ label: 'Restart', value: () => { ctrAction(c.Id, name.replace(/^\//, ''), 'restart'); return true; } });
         } else {
           buttons.push({ label: 'Start', cls: 'primary', handler: async () => { await POST('/docker/containers/' + c.Id + '/start'); toast('Started'); return true; } });
         }
@@ -253,6 +257,7 @@ async function activateTile(t) {
       const ports = c.Ports || [];
       const pub = ports.find((p) => p.PublicPort);
       if (pub) buttons.unshift({ label: 'Open UI', cls: 'primary', handler: () => { window.open(`http://${location.hostname}:${pub.PublicPort}`, '_blank', 'noopener'); return true; } });
+      buttons.splice(1, 0, { label: 'Details', value: () => { location.hash = `#/docker/c/${c.Id.slice(0, 12)}`; return true; } });
       await modal({ title: name.replace(/^\//, ''), body: `<p>State: <span class="chip ${running ? 'ok' : ''}">${esc(c.State)}</span></p><p class="muted small mono">${esc(c.Image || '')}</p>`, buttons });
     } catch (e) { toastErr(e); }
   }
@@ -268,15 +273,21 @@ Pages.home = (el) => {
         <div class="home-greet"><div class="muted" data-clock></div><h1 class="home-title">${greeting()}, ${esc(State.displayName || State.user)}</h1>
           <div class="muted home-host" data-hostline>…</div></div>
         <div class="row home-actions">
-          <a class="btn" href="#/launcher">${ICON.store || ICON.apps} All apps</a>
-          <button data-edit title="Edit home">${ICON.edit}</button>
-          <button data-logout>${ICON.logout}</button>
+          <a class="btn" href="#/launcher">${ICON.grid} All apps</a>
+          <button type="button" class="icon" data-search title="Search (Ctrl K)" aria-label="Search and commands (Ctrl K)">${ICON.search}</button>
+          <button type="button" class="icon bell" data-bell title="Activity (n)" aria-label="Activity and notifications" aria-haspopup="dialog">${ICON.bell}<span class="badge" data-bell-badge hidden></span></button>
+          <button type="button" class="icon" data-edit title="Edit home" aria-label="Customise home">${ICON.edit}</button>
+          <button type="button" class="icon" data-logout title="Sign out" aria-label="Sign out">${ICON.logout}</button>
         </div>
       </div>
+      <div data-checklist-host></div>
       <div class="home-grid" data-home-grid></div>
       <p class="muted small home-foot" style="margin-top:14px">Signed in as <b>${esc(State.user)}</b> · role <span class="chip plain">${esc(State.role)}</span><span class="spacer"></span><span class="mono" title="Version and build of the running Uiable">${esc(buildLabel())}</span></p>`;
     paintHomeGrid(el, layout);
+    renderChecklist($('[data-checklist-host]', el));
+    Activity.badge();
     $('[data-logout]', el).onclick = logout;
+    const ee = $('[data-edit-empty]', el); if (ee) ee.onclick = () => $('[data-edit]', el).click();
     $('[data-edit]', el).onclick = async () => {
       // Toggle: a second click while editing just saves & leaves (never mounts a second toolbar)
       if (Home.editing || Home.entering) { const done = $('.home-edit-bar [data-done]', el); if (done) done.click(); return; }
@@ -298,6 +309,8 @@ Pages.home = (el) => {
     // tile clicks
     $('[data-home-grid]', el).onclick = async (e) => {
       if (Home.editing) return;
+      const stat = e.target.closest('[data-stat]');
+      if (stat) { openStatExpand(stat.dataset.stat); return; }
       const btn = e.target.closest('[data-tid]');
       if (!btn || btn.classList.contains('is-widget')) {
         // notes tap to edit text for owner

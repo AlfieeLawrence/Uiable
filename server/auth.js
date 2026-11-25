@@ -60,8 +60,8 @@ async function createUser(username, password, role = 'admin') {
   checkPassword(password);
   if (findUser(username)) throw err('That account already exists', 409);
   const rec = { username, role, hash: await bcrypt.hash(password, BCRYPT_ROUNDS), created: new Date().toISOString() };
-  const dflt = linuxSettings().defaultUser;
-  if (dflt && (role === 'admin' || linuxSettings().allowed.includes(dflt))) rec.linuxUser = dflt;
+  // The default Linux user is only pre-selected in the first-login link dialog:
+  // linking always needs that Linux user's password (see linuxauth.js).
   config.users.push(rec);
   save(CONFIG, config);
 }
@@ -116,6 +116,23 @@ function setLinuxSettings({ defaultUser, allowed }) {
   config.settings.linux = { defaultUser: String(defaultUser || ''), allowed: [...new Set((allowed || []).map(String))].filter((n) => n !== 'root') };
   save(CONFIG, config);
   return linuxSettings();
+}
+// ---- Optional features (Settings → General → Features). Missing keys use the
+// defaults, so existing installs keep the app store on after upgrading.
+const FEATURE_DEFAULTS = { store: true };
+function features() {
+  const f = (config.settings && config.settings.features) || {};
+  const out = {};
+  for (const [k, d] of Object.entries(FEATURE_DEFAULTS)) out[k] = typeof f[k] === 'boolean' ? f[k] : d;
+  return out;
+}
+function setFeatures(patch) {
+  config.settings = config.settings || {};
+  const cur = features();
+  for (const k of Object.keys(FEATURE_DEFAULTS)) if (patch && typeof patch[k] === 'boolean') cur[k] = patch[k];
+  config.settings.features = cur;
+  save(CONFIG, config);
+  return features();
 }
 /** Bind (or clear with '') the Linux user for an account. skip=true records "ask me later" dismissal. */
 function setLinuxUser(username, linuxUser, { skip } = {}) {
@@ -432,7 +449,7 @@ const role = (min) => (req, res, next) => (req.session && atLeast(req.session.ro
 const rw = (readMin, writeMin) => (req, res, next) => role(['GET', 'HEAD'].includes(req.method) ? readMin : writeMin)(req, res, next);
 
 module.exports = {
-  DATA_DIR, ROLES, ROLE_NAMES, needsSetup, createUser, verify, setPassword, setRole, deleteUser, listUsers, findUser, renameUser, setDisplayName, linuxSettings, setLinuxSettings, setLinuxUser,
+  DATA_DIR, ROLES, ROLE_NAMES, needsSetup, createUser, verify, setPassword, setRole, deleteUser, listUsers, findUser, renameUser, setDisplayName, linuxSettings, setLinuxSettings, setLinuxUser, features, setFeatures, FEATURE_DEFAULTS,
   createSession, getSession, destroySession, requireAuth, sameOrigin, killSessions,
   listTokens, createApiToken, revokeApiToken, revokeAllApiTokens, verifyApiToken,
   rateLimited, recordFailure, clearFailures, atLeast, role, rw,

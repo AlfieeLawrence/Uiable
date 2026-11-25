@@ -59,4 +59,7 @@ function runFn(title, user, fn) {
 const get = (id) => jobs.get(id) || null;
 const view = (j) => j && ({ id: j.id, title: j.title, state: j.state, output: j.output, started: j.started, ended: j.ended, code: j.code });
 
-module.exports = { runHost, runFn, get, view, create, append, finish };
+/** Recent jobs, newest first (output omitted). */
+const list = () => [...jobs.values()].sort((a, b) => b.started - a.started).map((j) => ({ id: j.id, title: j.title, user: j.user, state: j.state, started: j.started, ended: j.ended, code: j.code }));
+
+module.exports = { runHost, runFn, get, view, create, append, finish, list };

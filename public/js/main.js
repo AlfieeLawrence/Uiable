@@ -36,7 +36,7 @@ function authScreen(setup) {
           if (r.twoFactor) { ticket = r.ticket; paint('2fa'); return; }
           State.user = r.user; State.role = r.role; State.csrf = r.csrf;
         }
-        const st = await GET('/state'); State.displayName = st.displayName || ''; State.linuxUser = st.linuxUser || '';
+        const st = await GET('/state'); State.displayName = st.displayName || ''; State.linuxUser = st.linuxUser || ''; State.features = st.features || { store: true };
         // Ask before routing: a hash change would route() and close the dialog
         if (st.needsBinding) { $('#app').innerHTML = '<div class="auth-wrap"></div>'; await linuxBindDlg({ firstLogin: true }); }
         if (!location.hash) location.hash = '#/'; else route();
@@ -53,7 +53,7 @@ async function boot() {
     if (s.build && window.UIABLE_BUILD && s.build !== window.UIABLE_BUILD && !sessionStorage.getItem('uiable-reload-' + s.build)) {
       sessionStorage.setItem('uiable-reload-' + s.build, '1'); location.reload(); return;
     }
-    State.version = s.version; State.build = s.build || ''; State.buildDate = s.buildDate || ''; State.user = s.user; State.role = s.role; State.csrf = s.csrf; State.displayName = s.displayName || ''; State.linuxUser = s.linuxUser || '';
+    State.version = s.version; State.build = s.build || ''; State.buildDate = s.buildDate || ''; State.user = s.user; State.role = s.role; State.csrf = s.csrf; State.displayName = s.displayName || ''; State.linuxUser = s.linuxUser || ''; State.features = s.features || { store: true };
     if (s.setup) return authScreen(true);
     if (!s.user) return authScreen(false);
     if (s.needsBinding) await linuxBindDlg({ firstLogin: true });
@@ -154,137 +154,112 @@ function updateWidgets(root, d) {
   sparkline(w('netspark'), [Stats.history.rx, Stats.history.tx], { colors: ['#7c5cff', '#f472b6'] });
 }
 
-/** Expanded live view for a home/dashboard widget. History is held in-browser only while open. */
+/**
+ * Full-detail view for a stat card (home tiles and the Dashboard widgets): time range
+ * (Live / 1h / 6h / 24h / 7d from the stored metrics history, clamped to retention),
+ * min / avg / max / current, hover tooltip, and a live per-core / per-device breakdown.
+ * Uses the shared modal (Esc / ✕ to close, background scroll locked).
+ */
+const STAT_META = {
+  cpu: { title: 'CPU', metric: 'cpu', icon: 'cpu', series: [['cpu', 'CPU', '#7c5cff']], max: 100, fmt: (v) => fmtPct(v, v < 10 ? 1 : 0), live: (d) => ({ cpu: d.cpu.usage }) },
+  mem: { title: 'Memory', metric: 'mem', icon: 'disk', series: [['mem', 'Memory used', '#22c1c3']], max: 100, fmt: (v) => fmtPct(v, 0), live: (d) => ({ mem: d.memory.total ? (d.memory.used / d.memory.total) * 100 : 0 }) },
+  disk: { title: 'Storage', metric: 'disk', icon: 'disk', series: [['dr', 'Read', '#7c5cff'], ['dw', 'Write', '#f472b6']], fmt: (v) => fmtRate(v), extraKey: ['disk', 'Root usage', (v) => fmtPct(v, 0)], live: (d) => { const p = d.primaryDisk || d.disks[0]; return { dr: (d.diskIo || {}).readRate || 0, dw: (d.diskIo || {}).writeRate || 0, disk: p ? (p.used / p.size) * 100 : null }; } },
+  net: { title: 'Network', metric: 'net', icon: 'globe', series: [['rx', 'Download', '#7c5cff'], ['tx', 'Upload', '#f472b6']], fmt: (v) => fmtRate(v), live: (d) => ({ rx: d.network.rxRate, tx: d.network.txRate }) },
+  temp: { title: 'Temperature', metric: 'temp', icon: 'thermo', series: [['temp', 'CPU temperature', '#f59e0b']], fmt: (v) => fmtNum(v, 0) + ' °C', live: (d) => ({ temp: d.cpuTemp }) },
+  gpu: { title: 'GPU', metric: 'gpu', icon: 'chart', series: [['gpu', 'GPU utilisation', '#a78bfa']], max: 100, fmt: (v) => fmtPct(v, 0), live: (d) => ({ gpu: d.gpu ? d.gpu.util : null }) },
+};
+const STAT_RANGES = [['live', 'Live'], ['1h', '1h'], ['6h', '6h'], ['24h', '24h'], ['7d', '7d']];
+
+function statBreakdownHtml(kind, d, procs) {
+  if (kind === 'cpu') return `<h3 class="sub-h">Per core <span class="muted small">${esc(d.info.cpuModel)} · ${d.info.cpuCount} threads</span></h3>
+    <div class="cores">${d.cpu.cores.map((c, i) => `<div class="core" title="CPU ${i}: ${fmtNum(c, 0)}%" role="img" aria-label="Core ${i} ${fmtNum(c, 0)} percent"><i style="height:${Math.min(100, c).toFixed(0)}%"></i><span>${fmtNum(c, 0)}</span></div>`).join('')}</div>
+    <div class="kv" style="margin-top:14px"><div>Load average (1 / 5 / 15 min)</div><div class="num">${d.load.map((x) => fmtNum(x, 2)).join(' · ')}</div><div>Temperature</div><div class="num">${d.cpuTemp != null ? fmtNum(d.cpuTemp, 0) + ' °C' : '–'}</div><div>Processes</div><div class="num">${esc(d.procs)}</div></div>`;
+  if (kind === 'mem') { const m0 = d.memory; return `<div class="kv"><div>Used</div><div class="num">${fmtBytes(m0.used)}</div><div>Available</div><div class="num">${fmtBytes(m0.available)}</div><div>Total</div><div class="num">${fmtBytes(m0.total)}</div><div>Cached</div><div class="num">${fmtBytes(m0.cached || 0)}</div><div>Buffers</div><div class="num">${fmtBytes(m0.buffers || 0)}</div><div>Swap</div><div class="num">${m0.swapTotal ? `${fmtBytes(m0.swapUsed)} / ${fmtBytes(m0.swapTotal)}` : 'none'}</div></div>
+    <h3 class="sub-h">Top memory processes</h3>${procs.length ? `<table><thead><tr><th>PID</th><th>User</th><th>Name</th><th class="right">RSS</th><th class="right">%</th></tr></thead><tbody>${procs.map((p) => `<tr><td class="mono">${p.pid}</td><td>${esc(p.user)}</td><td class="ellipsis">${esc(p.name)}</td><td class="right num">${fmtBytes(p.rss)}</td><td class="right num">${fmtNum(p.mem, 1)}</td></tr>`).join('')}</tbody></table>` : skel('text', 3)}`; }
+  if (kind === 'disk') { const dio = d.diskIo || { disks: [] }; const pm = d.primaryDisk && d.primaryDisk.mount; return `<h3 class="sub-h">Mounts</h3>${d.disks.map((x) => { const p = (x.used / x.size) * 100; return `<div class="mount-row"><div class="row small"><b class="ellipsis">${esc(x.mount)}</b>${x.mount === pm ? '<span class="chip ok">primary</span>' : ''}<span class="muted ellipsis grow">${esc(x.fs)} · ${esc(x.type)}</span><span class="num">${fmtBytes(x.used)} / ${fmtBytes(x.size)}</span></div>${bar(p)}<div class="muted small">${fmtBytes(x.avail)} free · ${fmtPct(p, 0)} used</div></div>`; }).join('') || '<div class="muted">No mounts</div>'}
+    ${dio.disks && dio.disks.length ? `<h3 class="sub-h">Per device I/O</h3><table><thead><tr><th>Device</th><th class="right">Read</th><th class="right">Write</th><th class="right">Total read / written</th></tr></thead><tbody>${dio.disks.map((x) => `<tr><td class="mono">${esc(x.name)}</td><td class="right num">${fmtRate(x.readRate)}</td><td class="right num">${fmtRate(x.writeRate)}</td><td class="right muted num">${fmtBytes(x.readBytes)} / ${fmtBytes(x.writeBytes)}</td></tr>`).join('')}</tbody></table>` : ''}`; }
+  if (kind === 'net') return `<h3 class="sub-h">Per interface</h3><table><thead><tr><th>Interface</th><th class="right">Download</th><th class="right">Upload</th><th class="right">Total ↓ / ↑</th></tr></thead><tbody>${d.network.interfaces.map((i) => `<tr><td class="mono">${esc(i.name)}</td><td class="right num">${fmtRate(i.rxRate)}</td><td class="right num">${fmtRate(i.txRate)}</td><td class="right muted num">${fmtBytes(i.rxBytes)} / ${fmtBytes(i.txBytes)}</td></tr>`).join('') || '<tr><td colspan="4" class="muted">No interfaces</td></tr>'}</tbody></table>`;
+  if (kind === 'temp') return `<h3 class="sub-h">Sensors</h3>${(d.temps || []).map((t) => `<div class="mount-row"><div class="row small"><span class="grow ellipsis">${esc(t.sensor)} <span class="muted">${esc(t.label)}</span></span><b class="num">${fmtNum(t.celsius, 1)} °C</b></div><div class="bar ${t.celsius >= 85 ? 'crit' : t.celsius >= 70 ? 'warn' : ''}"><i style="width:${Math.min(100, t.celsius)}%"></i></div></div>`).join('') || '<div class="muted">No temperature sensors are exposed on this host (common on VPS / cloud servers).</div>'}`;
+  if (kind === 'gpu') { const g = d.gpu; if (!g) return '<div class="muted">No GPU reported (nvidia-smi not available on this host).</div>'; return `<div class="kv"><div>Model</div><div>${esc(g.name)}</div><div>VRAM</div><div class="num">${g.memTotal ? `${fmtBytes(g.memUsed)} / ${fmtBytes(g.memTotal)}` : 'n/a'}</div><div>Temperature</div><div class="num">${g.temp != null ? fmtNum(g.temp, 0) + ' °C' : '–'}</div></div>
+    ${(g.devices || []).length > 1 ? `<h3 class="sub-h">Per GPU</h3><table><thead><tr><th>GPU</th><th class="right">Util</th><th class="right">VRAM</th><th class="right">Temp</th></tr></thead><tbody>${g.devices.map((x, i) => `<tr><td class="ellipsis">${esc(x.name || 'GPU ' + i)}</td><td class="right num">${x.util == null ? '–' : fmtNum(x.util, 0) + '%'}</td><td class="right num">${x.memTotal ? `${fmtBytes(x.memUsed)} / ${fmtBytes(x.memTotal)}` : '–'}</td><td class="right num">${x.temp != null ? fmtNum(x.temp, 0) + '°C' : '–'}</td></tr>`).join('')}</tbody></table>` : ''}`; }
+  return '';
+}
+
 function openStatExpand(kind) {
-  const titles = { cpu: 'CPU', mem: 'Memory', disk: 'Storage', net: 'Network', gpu: 'GPU' };
-  const hist = { cpu: [], mem: [], rx: [], tx: [], gpu: [] };
-  const cap = 100; // ~5 min at 3s
-  let unsub = null, timer = null, procs = [];
+  const M = STAT_META[kind]; if (!M) return;
+  const keys = M.series.map((x) => x[0]).concat(M.extraKey ? [M.extraKey[0]] : []);
+  const live = {}; keys.forEach((k) => { live[k] = []; });
+  // seed Live from the in-browser buffer (one sample ~ every 3 s)
+  const h = Stats.history; const seedMap = { cpu: h.cpu, mem: h.mem, rx: h.rx, tx: h.tx, gpu: h.gpu };
+  const now0 = Date.now();
+  keys.forEach((k) => { const arr = seedMap[k] || []; live[k] = arr.map((v, i) => ({ t: now0 - (arr.length - 1 - i) * 3000, v })); });
+  let range = localStorage.getItem('uiable-stat-range') || '1h'; let data = null; let retain = 7; let procs = []; let unsub = null; let ptimer = null;
+  const LIVE_CAP = 200;
 
-  const seed = () => {
-    const h = Stats.history;
-    if (kind === 'cpu') hist.cpu = h.cpu.slice(-cap);
-    if (kind === 'mem') hist.mem = h.mem.slice(-cap);
-    if (kind === 'net') { hist.rx = h.rx.slice(-cap); hist.tx = h.tx.slice(-cap); }
-    if (kind === 'gpu') hist.gpu = (h.gpu || []).slice(-cap);
+  const summaryOf = (k) => {
+    if (range !== 'live' && data) return data.summary[k] || {};
+    const vals = live[k].map((p) => p.v).filter((v) => v != null);
+    if (!vals.length) return {};
+    return { min: Math.min(...vals), max: Math.max(...vals), avg: vals.reduce((a, b) => a + b, 0) / vals.length, current: vals[vals.length - 1], count: vals.length };
   };
-  seed();
-
-  const loadProcs = async () => {
-    if (kind !== 'mem') return;
+  const paintSummary = (m) => {
+    const rows = M.series.map(([k, label, color]) => [k, label, color, M.fmt]).concat(M.extraKey ? [[M.extraKey[0], M.extraKey[1], null, M.extraKey[2]]] : []);
+    const f = (fn, v) => (v == null ? '–' : fn(v));
+    $('[data-sum]', m).innerHTML = `<table class="sum-table"><thead><tr><th></th><th class="right">Current</th><th class="right">Average</th><th class="right">Min</th><th class="right">Max</th></tr></thead><tbody>${rows.map(([k, label, color, fn]) => { const s = summaryOf(k); const cur = range === 'live' || s.current == null ? (live[k].length ? live[k][live[k].length - 1].v : s.current) : s.current; return `<tr><td>${color ? `<i class="key" style="background:${color}"></i>` : ''}${esc(label)}</td><td class="right num"><b>${f(fn, cur)}</b></td><td class="right num">${f(fn, s.avg)}</td><td class="right num">${f(fn, s.min)}</td><td class="right num">${f(fn, s.max)}</td></tr>`; }).join('')}</tbody></table>`;
+  };
+  const paintChart = (m) => {
+    const cv = $('[data-chart]', m); const note = $('[data-chart-note]', m);
+    let series;
+    if (range === 'live') series = M.series.map(([k, label, color]) => ({ label, color, data: live[k] }));
+    else series = M.series.map(([k, label, color]) => ({ label, color, data: (data ? data.points : []).map((p) => ({ t: p.t, v: p[k], lo: p[k + 'Min'], hi: p[k + 'Max'] })) }));
+    const has = series.some((s) => s.data.some((p) => p.v != null));
+    note.hidden = has;
+    if (!has) note.innerHTML = range === 'live' ? 'Collecting live samples…' : `No stored history for this range yet. Uiable records a sample every ${data ? data.intervalSec : 60} s and keeps ${retain} day${retain === 1 ? '' : 's'} (Metrics history → Settings).`;
+    const opts = { max: M.max, fmt: M.fmt, tipEl: $('[data-tip]', m) };
+    if (range !== 'live' && data) Object.assign(opts, { from: data.from, to: data.to });
+    if (range === 'live') Object.assign(opts, { from: Date.now() - Math.max(60000, (live[M.series[0][0]].length) * 3000), to: Date.now() });
+    drawChart(cv, has ? series : [{ label: '', color: '#888888', data: [] }], opts);
+    const s = summaryOf(M.series[0][0]);
+    cv.setAttribute('aria-label', `${M.title} ${range === 'live' ? 'live' : 'over ' + range}: average ${s.avg == null ? 'unknown' : M.fmt(s.avg)}, max ${s.max == null ? 'unknown' : M.fmt(s.max)}`);
+  };
+  const loadRange = async (m) => {
+    if (range === 'live') { data = null; paintChart(m); paintSummary(m); return; }
+    $('[data-chart-wrap]', m).classList.add('loading');
     try {
-      const r = await GET('/system/processes');
-      procs = (r.processes || []).slice().sort((a, b) => b.rss - a.rss).slice(0, 8);
-    } catch (_) { procs = []; }
-  };
-
-  const paint = (m, d) => {
-    if (!d) return;
-    const body = $('[data-exp]', m);
-    if (!body) return;
-    if (kind === 'cpu') {
-      hist.cpu.push(d.cpu.usage); while (hist.cpu.length > cap) hist.cpu.shift();
-      body.innerHTML = `
-        <div class="row wrap" style="gap:16px;margin-bottom:12px">
-          <div><div class="label">Usage</div><div class="big num">${fmtPct(d.cpu.usage, 1)}</div></div>
-          <div><div class="label">Temp</div><div class="big num" style="font-size:22px">${d.cpuTemp != null ? fmtNum(d.cpuTemp, 0) + ' °C' : '–'}</div></div>
-          <div class="grow"><div class="label">Load average</div><div class="num">${d.load.map((x) => fmtNum(x, 2)).join(' · ')}</div>
-            <div class="muted small">1 / 5 / 15 min</div></div>
-        </div>
-        <div class="cores" style="margin-bottom:12px">${d.cpu.cores.map((c, i) => `<div class="core" title="CPU ${i}"><i style="height:${c.toFixed(0)}%"></i><span>${fmtNum(c, 0)}</span></div>`).join('')}</div>
-        <div class="muted small" style="margin-bottom:6px">${esc(d.info.cpuModel)} · ${d.info.cpuCount} threads · last ~5 min (in-browser)</div>
-        <canvas class="spark expand-chart" data-chart height="120"></canvas>`;
-      sparkline($('[data-chart]', body), [hist.cpu], { max: 100 });
-    } else if (kind === 'mem') {
-      hist.mem.push(d.memory.total ? (d.memory.used / d.memory.total) * 100 : 0);
-      while (hist.mem.length > cap) hist.mem.shift();
-      const m0 = d.memory;
-      body.innerHTML = `
-        <div class="grid cols-2" style="margin-bottom:12px">
-          <div><div class="label">Used</div><div class="big num">${fmtBytes(m0.used)}</div></div>
-          <div><div class="label">Available</div><div class="big num">${fmtBytes(m0.available)}</div></div>
-        </div>
-        <div class="kv" style="margin-bottom:14px">
-          <div>Total</div><div class="num">${fmtBytes(m0.total)}</div>
-          <div>Free</div><div class="num">${fmtBytes(m0.free || 0)}</div>
-          <div>Cached</div><div class="num">${fmtBytes(m0.cached || 0)}</div>
-          <div>Buffers</div><div class="num">${fmtBytes(m0.buffers || 0)}</div>
-          <div>Swap</div><div class="num">${m0.swapTotal ? `${fmtBytes(m0.swapUsed)} / ${fmtBytes(m0.swapTotal)}` : 'none'}</div>
-        </div>
-        <canvas class="spark expand-chart" data-chart height="100" style="margin-bottom:14px"></canvas>
-        <div class="card-title" style="margin-bottom:8px">Top memory processes</div>
-        ${procs.length ? `<table><thead><tr><th>PID</th><th>User</th><th>Name</th><th class="right">RSS</th><th class="right">%</th></tr></thead><tbody>
-          ${procs.map((p) => `<tr><td class="mono">${p.pid}</td><td>${esc(p.user)}</td><td class="ellipsis">${esc(p.name)}</td><td class="right num">${fmtBytes(p.rss)}</td><td class="right num">${fmtNum(p.mem, 1)}</td></tr>`).join('')}
-        </tbody></table>` : '<div class="muted small">Loading processes…</div>'}`;
-      sparkline($('[data-chart]', body), [hist.mem], { max: 100, colors: ['#22c1c3'] });
-    } else if (kind === 'disk') {
-      const dio = d.diskIo || { disks: [], readRate: 0, writeRate: 0 };
-      const primaryMount = d.primaryDisk && d.primaryDisk.mount;
-      body.innerHTML = `
-        <div class="row wrap" style="gap:20px;margin-bottom:14px">
-          <div><div class="label">Read</div><div class="big num" style="font-size:22px">${fmtRate(dio.readRate)}</div></div>
-          <div><div class="label">Write</div><div class="big num" style="font-size:22px">${fmtRate(dio.writeRate)}</div></div>
-        </div>
-        ${d.disks.map((x) => {
-          const p = (x.used / x.size) * 100;
-          const isP = x.mount === primaryMount;
-          return `<div style="margin-bottom:14px"><div class="row small"><b class="ellipsis">${esc(x.mount)}</b>${isP ? '<span class="chip ok">primary</span>' : ''}
-            <span class="muted ellipsis grow">${esc(x.fs)} · ${esc(x.type)}</span>
-            <span class="num">${fmtBytes(x.used)} / ${fmtBytes(x.size)}</span></div>
-            <div style="margin-top:6px">${bar(p)}</div>
-            <div class="muted small">${fmtBytes(x.avail)} free</div></div>`;
-        }).join('') || '<div class="muted">No mounts</div>'}
-        ${dio.disks.length ? `<div class="card-title" style="margin:16px 0 8px">Disk IO</div>
-          <table><thead><tr><th>Device</th><th class="right">↓ Read</th><th class="right">↑ Write</th><th class="right">Total</th></tr></thead><tbody>
-          ${dio.disks.map((x) => `<tr><td class="mono">${esc(x.name)}</td><td class="right num">${fmtRate(x.readRate)}</td><td class="right num">${fmtRate(x.writeRate)}</td>
-            <td class="right muted num">${fmtBytes(x.readBytes)} / ${fmtBytes(x.writeBytes)}</td></tr>`).join('')}
-          </tbody></table>` : ''}`;
-    } else if (kind === 'net') {
-      hist.rx.push(d.network.rxRate); hist.tx.push(d.network.txRate);
-      while (hist.rx.length > cap) hist.rx.shift(); while (hist.tx.length > cap) hist.tx.shift();
-      body.innerHTML = `
-        <div class="row wrap" style="gap:20px;margin-bottom:12px">
-          <div><div class="label">↓ Download</div><div class="big num" style="font-size:22px">${fmtRate(d.network.rxRate)}</div></div>
-          <div><div class="label">↑ Upload</div><div class="big num" style="font-size:22px">${fmtRate(d.network.txRate)}</div></div>
-        </div>
-        <div class="muted small" style="margin-bottom:6px">Last ~5 min (in-browser only)</div>
-        <canvas class="spark expand-chart" data-chart height="120" style="margin-bottom:14px"></canvas>
-        <table><thead><tr><th>Interface</th><th class="right">↓ Rate</th><th class="right">↑ Rate</th><th class="right">Total ↓/↑</th></tr></thead><tbody>
-          ${d.network.interfaces.map((i) => `<tr><td class="mono">${esc(i.name)}</td><td class="right num">${fmtRate(i.rxRate)}</td><td class="right num">${fmtRate(i.txRate)}</td>
-            <td class="right muted num">${fmtBytes(i.rxBytes)} / ${fmtBytes(i.txBytes)}</td></tr>`).join('') || '<tr><td colspan="4" class="muted">No interfaces</td></tr>'}
-        </tbody></table>`;
-      sparkline($('[data-chart]', body), [hist.rx, hist.tx], { colors: ['#7c5cff', '#f472b6'] });
-    } else if (kind === 'gpu') {
-      if (!d.gpu) { body.innerHTML = '<div class="muted">No NVIDIA GPU reported (nvidia-smi not available on this host).</div>'; return; }
-      hist.gpu.push(d.gpu.util == null ? 0 : d.gpu.util); while (hist.gpu.length > cap) hist.gpu.shift();
-      const g = d.gpu;
-      body.innerHTML = `
-        <div class="row wrap" style="gap:16px;margin-bottom:12px">
-          <div><div class="label">Utilisation</div><div class="big num">${g.util == null ? '–' : fmtPct(g.util, 0)}</div></div>
-          <div><div class="label">VRAM</div><div class="big num" style="font-size:22px">${g.memTotal ? `${fmtBytes(g.memUsed)} / ${fmtBytes(g.memTotal)}` : 'n/a'}</div></div>
-          <div><div class="label">Temp</div><div class="big num" style="font-size:22px">${g.temp != null ? fmtNum(g.temp, 0) + ' °C' : '–'}</div></div>
-        </div>
-        <div class="muted small" style="margin-bottom:8px">${esc(g.name)}${g.count > 1 ? ` · ${g.count} GPUs` : ''}</div>
-        <div style="margin-bottom:12px">${bar(g.util || 0)}</div>
-        <canvas class="spark expand-chart" data-chart height="120" style="margin-bottom:14px"></canvas>
-        ${(g.devices || []).length > 1 ? `<table><thead><tr><th>GPU</th><th class="right">Util</th><th class="right">VRAM</th><th class="right">Temp</th></tr></thead><tbody>
-          ${g.devices.map((x, i) => `<tr><td class="ellipsis">${esc(x.name || ('GPU ' + i))}</td><td class="right num">${x.util == null ? '–' : fmtNum(x.util, 0) + '%'}</td>
-            <td class="right num">${x.memTotal ? `${fmtBytes(x.memUsed)} / ${fmtBytes(x.memTotal)}` : '–'}</td>
-            <td class="right num">${x.temp != null ? fmtNum(x.temp, 0) + '°C' : '–'}</td></tr>`).join('')}
-        </tbody></table>` : ''}`;
-      sparkline($('[data-chart]', body), [hist.gpu], { max: 100, colors: ['#a78bfa'] });
-    }
+      data = await GET(`/metrics/range?metric=${M.metric}&range=${range}&points=240`);
+      retain = data.retainDays;
+      $$('[data-range]', m).forEach((b) => { const hrs = { '1h': 1, '6h': 6, '24h': 24, '7d': 168 }[b.dataset.range]; b.disabled = hrs && hrs > retain * 24; if (b.disabled) b.title = `History is kept for ${retain} day${retain === 1 ? '' : 's'}`; });
+    } catch (e) { data = null; $('[data-chart-note]', m).textContent = e.message; }
+    $('[data-chart-wrap]', m).classList.remove('loading');
+    paintChart(m); paintSummary(m);
   };
 
   modal({
-    title: titles[kind] || kind, wide: true,
-    body: `<div data-exp><div class="empty"><span class="spinner"></span></div></div>`,
+    title: M.title, wide: true, cls: 'stat-modal',
+    body: `<div class="stat-head row wrap"><div class="seg" role="radiogroup" aria-label="Time range">${STAT_RANGES.map(([id, l]) => `<button type="button" role="radio" data-range="${id}" aria-checked="${id === range}" class="${id === range ? 'active' : ''}">${l}</button>`).join('')}</div><span class="spacer"></span><span class="legend">${M.series.map(([, l, c]) => `<span><i class="key" style="background:${c}"></i>${esc(l)}</span>`).join('')}</span></div>
+      <div class="chart-wrap" data-chart-wrap><canvas class="big-chart" data-chart role="img" tabindex="0"></canvas><div class="chart-tip" data-tip hidden></div><div class="chart-note muted small" data-chart-note hidden></div></div>
+      <div data-sum class="sum"></div>
+      <div data-breakdown class="breakdown">${skel('text', 4)}</div>`,
     buttons: [{ label: 'Close', value: null }],
     onOpen: (m) => {
-      loadProcs().then(() => { if (Stats.last) paint(m, Stats.last); });
-      unsub = Stats.subscribe((d) => paint(m, d));
-      if (kind === 'mem') timer = setInterval(loadProcs, 8000);
-      return () => { if (unsub) unsub(); clearInterval(timer); };
+      $$('[data-range]', m).forEach((b) => (b.onclick = () => {
+        range = b.dataset.range; localStorage.setItem('uiable-stat-range', range);
+        $$('[data-range]', m).forEach((x) => { x.classList.toggle('active', x === b); x.setAttribute('aria-checked', x === b); });
+        loadRange(m);
+      }));
+      const onResize = () => paintChart(m);
+      window.addEventListener('resize', onResize);
+      const loadProcs = async () => { if (kind !== 'mem') return; try { procs = ((await GET('/system/processes')).processes || []).slice().sort((a, b) => b.rss - a.rss).slice(0, 8); } catch (_) { procs = []; } };
+      loadProcs(); if (kind === 'mem') ptimer = setInterval(loadProcs, 8000);
+      unsub = Stats.subscribe((d) => {
+        const v = M.live(d); const t = Date.now();
+        keys.forEach((k) => { if (v[k] !== undefined) { live[k].push({ t, v: v[k] }); while (live[k].length > LIVE_CAP) live[k].shift(); } });
+        const bd = $('[data-breakdown]', m); if (bd) bd.innerHTML = statBreakdownHtml(kind, d, procs);
+        if (range === 'live') paintChart(m);
+        paintSummary(m);
+      });
+      requestAnimationFrame(() => loadRange(m));
+      return () => { if (unsub) unsub(); clearInterval(ptimer); window.removeEventListener('resize', onResize); };
     },
   });
 }
@@ -300,12 +275,12 @@ Pages.dashboard = (el) => {
   el.innerHTML = `${widgetsHtml()}
   <div class="grid cols-2" style="margin-top:16px">
     <div class="card"><div class="card-title">${ICON.info} System</div><div class="kv" data-k="sys"></div></div>
-    <div class="card"><div class="card-title">${ICON.cpu} CPU cores</div><div class="cores" data-k="cores"></div><div class="muted small" style="margin-top:12px" data-k="cpumodel"></div></div>
-    <div class="card"><div class="card-title">${ICON.disk} Disks</div><div data-k="disks"></div></div>
-    <div class="card"><div class="card-title">${ICON.globe} Network interfaces</div><div data-k="net"></div></div>
-    <div class="card"><div class="card-title">🌡️ Temperatures</div><div data-k="temps"></div></div>
-    <div class="card"><div class="card-title">${ICON.disk} Memory &amp; swap</div><div data-k="mem"></div></div>
-    <div class="card hidden" data-gpu-card><div class="card-title">GPU</div><div data-k="gpu"></div></div>
+    <div class="card"><div class="card-title">${ICON.cpu} CPU cores<span class="spacer"></span><button type="button" class="sm" data-expand="cpu" aria-label="Open cpu details">Details</button></div><div class="cores" data-k="cores"></div><div class="muted small" style="margin-top:12px" data-k="cpumodel"></div></div>
+    <div class="card"><div class="card-title">${ICON.disk} Disks<span class="spacer"></span><button type="button" class="sm" data-expand="disk" aria-label="Open disk details">Details</button></div><div data-k="disks"></div></div>
+    <div class="card"><div class="card-title">${ICON.globe} Network interfaces<span class="spacer"></span><button type="button" class="sm" data-expand="net" aria-label="Open net details">Details</button></div><div data-k="net"></div></div>
+    <div class="card"><div class="card-title">${ICON.thermo} Temperatures<span class="spacer"></span><button type="button" class="sm" data-expand="temp" aria-label="Open temp details">Details</button></div><div data-k="temps"></div></div>
+    <div class="card"><div class="card-title">${ICON.disk} Memory &amp; swap<span class="spacer"></span><button type="button" class="sm" data-expand="mem" aria-label="Open mem details">Details</button></div><div data-k="mem"></div></div>
+    <div class="card hidden" data-gpu-card><div class="card-title">GPU<span class="spacer"></span><button type="button" class="sm" data-expand="gpu">Details</button></div><div data-k="gpu"></div></div>
   </div>`;
   bindWidgetClicks(el);
   const k = (n) => $(`[data-k="${n}"]`, el);

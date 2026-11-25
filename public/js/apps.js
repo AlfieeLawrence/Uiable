@@ -2,7 +2,7 @@
 /* Umbrel-style app store: hero, categories, search, card grid, detail modal, Installed tab. */
 
 const STORE_CATS = ['All', 'Media', 'Home', 'Network', 'Security', 'Dev', 'Tools'];
-const storeIcon = (a) => `<img class="store-icon" src="/icons/apps/${esc(a.icon || a.id)}.svg" alt="" width="56" height="56" loading="lazy" onerror="this.style.display='none'">`;
+const storeIcon = (a) => `<img class="store-icon" src="/icons/apps/${esc(a.icon || a.id)}.svg" alt="" width="56" height="56" loading="lazy" data-hide-broken>`;
 
 Pages.apps = (el) => {
   el.innerHTML = `<div class="store">

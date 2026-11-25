@@ -287,6 +287,9 @@ function healthUrl() {
   return process.env.UIABLE_HEALTH_URL || ('http://127.0.0.1:' + (process.env.UIABLE_PORT || process.env.PORT || '8080') + '/api/health');
 }
 
+// Last self-update check result (the activity centre reads it; never triggers a fetch itself).
+const selfState = { at: 0, current: null, latest: null, update: false, url: null };
+const imagesCached = () => (cache.images && cache.images.images ? cache.images : null);
 router.get('/self', wrap(async (req, res) => {
   const current = currentVersion();
   const repo = REPO();
@@ -301,6 +304,7 @@ router.get('/self', wrap(async (req, res) => {
       const st = await host.run('sh', ['-c', 'test -d "$0" && test -f "$0/package.json" && echo yes', bak], { timeout: 5000 });
       rollbackReady = (st.stdout || '').includes('yes');
     } catch (_) {}
+    Object.assign(selfState, { at: Date.now(), current, latest, update: latest ? cmpVer(latest, current) > 0 : false, url: rel.html_url });
     res.json({
       available: true,
       current,
@@ -423,4 +427,4 @@ router.post('/self/rollback', wrap(async (req, res) => {
 
 
 
-module.exports = Object.assign(router, { hostPackages, imageUpdates });
+module.exports = Object.assign(router, { hostPackages, imageUpdates, selfState, imagesCached, hostCached: () => cache.packages || null });
